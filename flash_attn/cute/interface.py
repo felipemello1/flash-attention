@@ -54,6 +54,7 @@ from flash_attn.cute.flash_bwd_postprocess import (
     DSinkReduceKernel,
 )
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
+from flash_attn.cute.flash_fwd_decode_sm100 import FlashAttentionDecodeSwappedSm100
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
 from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
@@ -674,6 +675,106 @@ def _mla_fwd_plan(
 
 
 
+def _decode_swap_ab_num_splits(
+    num_splits: int, batch_size: int, num_head_kv: int, max_seqlen_k: int, num_sms: int
+) -> int:
+    """Splits for FlashAttentionDecodeSwappedSm100. num_splits >= 1 is kept (1 is batch
+    invariant). Auto fills the SMs, with at most 16 splits and at least 4 key blocks each:
+    shared-prefix decode is latency-bound and needs the CTAs (GB300 bs16 x 32k shared:
+    238 us at 1 split, 131 at 2), while distinct pages are HBM-bound from ~64 CTAs on."""
+    if num_splits >= 1:
+        return num_splits
+    num_n_blocks = (max_seqlen_k + FlashAttentionDecodeSwappedSm100.n_block_size - 1) // (
+        FlashAttentionDecodeSwappedSm100.n_block_size
+    )
+    return max(1, min(num_sms // (batch_size * num_head_kv), num_n_blocks // 4, 16))
+
+
+def _flash_attn_fwd_decode_swap_ab(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: Optional[torch.Tensor],
+    cu_seqlens_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
+    page_table: torch.Tensor,
+    softmax_scale: float,
+    num_splits: int,
+    max_seqlen_k: int,
+    arch: int,
+) -> None:
+    """Run FlashAttentionDecodeSwappedSm100 (see its docstring), plus the combine for split-KV.
+
+    The kernel takes rows-first views: q, out (rows, h, d) and lse (rows, h), where a row is a
+    batch index, or the token index cu_seqlens_q[b] with varlen.
+    """
+    if is_fake_mode():
+        return
+    varlen = cu_seqlens_q is not None
+    batch_size, num_head_kv = page_table.shape[0], v.shape[2]
+    num_head = q.shape[-2]
+    num_splits = _decode_swap_ab_num_splits(
+        num_splits, batch_size, num_head_kv, max_seqlen_k,
+        get_num_sms_for_selection(q.device.index, arch),
+    )
+    is_split_kv = num_splits > 1
+    q_rows = q if varlen else q[:, 0]
+    if is_split_kv:
+        out_partial = torch.empty(
+            num_splits, *out.shape, dtype=torch.float32, device=q.device
+        )
+        lse_partial = torch.empty(
+            num_splits, *(lse.shape if lse is not None else (
+                (num_head, q.shape[0]) if varlen else (batch_size, num_head, 1)
+            )), dtype=torch.float32, device=q.device,
+        )
+        o_rows = out_partial if varlen else out_partial[:, :, 0]
+        lse_rows = lse_partial.transpose(1, 2) if varlen else lse_partial[..., 0]
+    else:
+        o_rows = out if varlen else out[:, 0]
+        lse_rows = None if lse is None else (lse.t() if varlen else lse[..., 0])
+    lse_leading_dim = (1 if varlen else 2) if is_split_kv else (0 if varlen else 1)
+    compile_key = (
+        q.dtype, num_head // num_head_kv, is_split_kv, varlen, seqused_k is not None,
+        lse_rows is not None, arch,
+    )
+    if compile_key not in _flash_attn_fwd_decode_swap_ab.compile_cache:
+        fa_fwd = FlashAttentionDecodeSwappedSm100(num_head // num_head_kv, is_split_kv=is_split_kv)
+        _flash_attn_fwd_decode_swap_ab.compile_cache[compile_key] = cute.compile(
+            fa_fwd,
+            to_cute_tensor(q_rows),
+            to_cute_tensor(k),
+            to_cute_tensor(v),
+            to_cute_tensor(o_rows),
+            to_cute_tensor(lse_rows, assumed_align=4, leading_dim=lse_leading_dim),
+            softmax_scale,
+            to_cute_tensor(cu_seqlens_q, assumed_align=4, leading_dim=0),
+            to_cute_tensor(seqused_k, assumed_align=4, leading_dim=0),
+            to_cute_tensor(page_table, assumed_align=4, leading_dim=1),
+            Int32(num_splits),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    _flash_attn_fwd_decode_swap_ab.compile_cache[compile_key](
+        q_rows.detach(), k.detach(), v.detach(), o_rows, lse_rows, softmax_scale,
+        cu_seqlens_q, seqused_k, page_table, num_splits,
+    )
+    if is_split_kv:
+        _flash_attn_fwd_combine(
+            out_partial,
+            lse_partial.transpose(-1, -2),
+            out,
+            lse.transpose(-1, -2) if lse is not None else None,
+            cu_seqlens_q,
+            None,
+            _arch=arch,
+        )
+
+
+_flash_attn_fwd_decode_swap_ab.compile_cache = get_jit_cache("fwd_decode_swap_ab")
+
+
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -960,6 +1061,40 @@ def _flash_attn_fwd(
     # Separate use of provided and replacement max_seqlen_q as host-side hint.
     seqlen_q_hint = seqlen_q if cu_seqlens_q is None else max_seqlen_q
     seqlen_q_known = seqlen_q if cu_seqlens_q is None else host_max_seqlen_q
+
+    # GQA decode with swapped MMA operands: one query token per sequence, hd256, paged KV.
+    if (
+        arch // 10 == 10
+        and q is not None
+        and qv is None
+        and not requires_grad
+        and seqlen_q_known == 1
+        and FlashAttentionDecodeSwappedSm100.can_implement(
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            qhead_per_kvhead=qhead_per_kvhead,
+            page_size=page_size,
+            max_seqlen_q=seqlen_q_known,
+            is_fp8=is_fp8,
+        )
+        and not local
+        and softcap is None
+        and score_mod is None
+        and mask_mod is None
+        and learnable_sink is None
+        and not use_block_sparsity
+        and aux_tensors is None
+        and seqused_q is None
+        and gather_kv_indices is None
+        and seqlen_k_per_split is None
+        and scheduler_metadata is None
+        and not utils._get_disable_decode_swap_ab_default()
+    ):
+        _flash_attn_fwd_decode_swap_ab(
+            q, k, v, out, lse, cu_seqlens_q, seqused_k, page_table, softmax_scale,
+            num_splits, max_seqlen_k, arch,
+        )
+        return out, lse, None, None, None
 
     # MLA (qv): 1CTA or 2CTA kernel. Decided here: the sparse head padding below and the
     # MLA plan (_mla_fwd_plan) depend on it.
