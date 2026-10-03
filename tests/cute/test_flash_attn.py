@@ -3679,3 +3679,51 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
     )
 
 
+@pytest.mark.skipif(not IS_SM100, reason="SplitKV is only supported on SM100")
+@pytest.mark.skipif(DISABLE_SPLIT, reason="SplitKV disabled")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_varlen_seqlen_k_per_split_hd256(monkeypatch):
+    """hd256 with fixed splits: query chunking and batch invariance are bitwise.
+
+    Training calls with long documents run in query chunks to bound the fp32 partials; a
+    document alone and inside a packed batch must also give the same bits.
+    """
+    import flash_attn.cute.interface as fa_interface
+
+    device, dtype, d = "cuda", torch.bfloat16, 256
+    nheads, nheads_kv, split = 16, 4, 2048
+    seqlens = [5000, 1, 2500, 129]
+    torch.random.manual_seed(0)
+    q = torch.randn(sum(seqlens), nheads, d, device=device, dtype=dtype)
+    k = torch.randn(sum(seqlens), nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+
+    def run(n):
+        cu = torch.tensor([0] + list(itertools.accumulate(seqlens[:n])), dtype=torch.int32, device=device)
+        rows = cu[-1]
+        return flash_attn_varlen_func(
+            q[:rows], k[:rows], v[:rows], cu_seqlens_q=cu, cu_seqlens_k=cu,
+            max_seqlen_q=seqlens[0], max_seqlen_k=seqlens[0], causal=True,
+            num_splits=3, seqlen_k_per_split=split, return_lse=True,
+        )
+
+    out, lse = run(len(seqlens))
+    out_alone, _ = run(1)
+    # About 600 query rows per chunk, so chunks cross document boundaries.
+    monkeypatch.setattr(fa_interface, "FIXED_SPLIT_PARTIAL_BUDGET_BYTES", 3 * 600 * nheads * d * 4)
+    out_chunked, lse_chunked = run(len(seqlens))
+
+    if is_fake_mode():
+        return
+
+    out_ref, _ = attention_ref(q[None, : seqlens[0]], k[None, : seqlens[0]], v[None, : seqlens[0]], causal=True)
+    out_pt, _ = attention_ref(
+        q[None, : seqlens[0]], k[None, : seqlens[0]], v[None, : seqlens[0]], causal=True,
+        upcast=False, reorder_ops=True,
+    )
+    pt_err = (out_pt - out_ref).abs().max().item()
+    assert (out[None, : seqlens[0]] - out_ref).abs().max().item() <= 2 * pt_err + 1e-4
+    assert torch.equal(out_alone, out[: seqlens[0]])
+    assert torch.equal(out_chunked, out) and torch.equal(lse_chunked, lse)
+
+
