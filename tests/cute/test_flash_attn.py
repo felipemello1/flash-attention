@@ -3057,6 +3057,83 @@ def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
     )
 
 
+@pytest.mark.parametrize("varlen_q", [False, True])
+@pytest.mark.parametrize("num_splits", [1, 0])
+@pytest.mark.parametrize("nheads,nheads_kv", [(16, 4), (24, 4)])
+def test_flash_attn_hd256_sm100_decode_swap_ab(
+    nheads, nheads_kv, num_splits, varlen_q, monkeypatch
+):
+    """Paged hd256 decode on the swapped-operand kernel: matches an fp32 reference, and with
+    num_splits=1 a sequence's output is bitwise the same alone or inside a batch."""
+    if not IS_SM100:
+        pytest.skip("SM100-specific decode kernel")
+    import flash_attn.cute.interface as fa_interface
+
+    calls = []
+    decode = fa_interface._flash_attn_fwd_decode_swap_ab
+
+    def counted_decode(*args, **kwargs):
+        calls.append(1)
+        return decode(*args, **kwargs)
+
+    counted_decode.compile_cache = decode.compile_cache
+    monkeypatch.setattr(fa_interface, "_flash_attn_fwd_decode_swap_ab", counted_decode)
+    d, page_size = 256, 128
+    lengths = [1, 127, 128, 129, 1000, 3000, 8191]
+    torch.random.manual_seed(0)
+
+    def run(q, k_cache, v_cache, seqlens_k, page_table):
+        bs = q.shape[0]
+        cu_seqlens_q = torch.arange(bs + 1, dtype=torch.int32, device="cuda") if varlen_q else None
+        out, lse, *_ = _flash_attn_fwd(
+            q if varlen_q else q[:, None],
+            k_cache,
+            v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=1,
+            seqused_k=torch.tensor(seqlens_k, dtype=torch.int32, device="cuda"),
+            page_table=page_table,
+            num_splits=num_splits,
+            return_lse=True,
+        )
+        return (out, lse.t()) if varlen_q else (out[:, 0], lse[..., 0])
+
+    for bs in (1, 3, 16, 64):
+        seqlens_k = [32768] if bs == 1 else [lengths[(i + bs) % len(lengths)] for i in range(bs)]
+        pages_per_seq = [(n + page_size - 1) // page_size for n in seqlens_k]
+        num_pages = sum(pages_per_seq) + 1
+        q = torch.randn(bs, nheads, d, device="cuda", dtype=torch.bfloat16)
+        k_cache = torch.randn(
+            num_pages, page_size, nheads_kv, d, device="cuda", dtype=torch.bfloat16
+        )
+        v_cache = torch.randn_like(k_cache)
+        perm = torch.randperm(num_pages, device="cuda").to(torch.int32)
+        page_table = torch.zeros(bs, max(pages_per_seq), dtype=torch.int32, device="cuda")
+        offsets = list(itertools.accumulate(pages_per_seq, initial=0))
+        for b in range(bs):
+            page_table[b, : pages_per_seq[b]] = perm[offsets[b] : offsets[b + 1]]
+        out, lse = run(q, k_cache, v_cache, seqlens_k, page_table)
+
+        for b in range(bs):
+            n = seqlens_k[b]
+            pages = page_table[b, : pages_per_seq[b]].long()
+            k = k_cache[pages].reshape(-1, nheads_kv, d)[:n].float()
+            v = v_cache[pages].reshape(-1, nheads_kv, d)[:n].float()
+            k, v = [t.repeat_interleave(nheads // nheads_kv, dim=1) for t in (k, v)]
+            s = torch.einsum("hd,nhd->hn", q[b].float(), k) / math.sqrt(d)
+            out_ref = torch.einsum("hn,nhd->hd", torch.softmax(s, dim=-1), v)
+            assert (out[b].float() - out_ref).abs().max().item() < 1e-2
+            assert (lse[b] - torch.logsumexp(s, dim=-1)).abs().max().item() < 1e-3
+
+        if num_splits == 1 and bs > 1:
+            sub = [1, 0, bs - 1]
+            out_sub, lse_sub = run(
+                q[sub], k_cache, v_cache, [seqlens_k[b] for b in sub], page_table[sub]
+            )
+            assert torch.equal(out_sub, out[sub]) and torch.equal(lse_sub, lse[sub])
+    assert calls, "decode did not route to the swapped-operand kernel"
+
+
 @pytest.mark.parametrize("head_dim", [128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_sm100_tma_capacity(head_dim):
@@ -3229,8 +3306,9 @@ def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q,
     assert out_paged.abs().max().item() < 10.0, (
         "Paged seqused_k output has poison-scale magnitudes: KV past seqused_k leaked"
     )
-    # SplitKV rounds the fp32 combine to bf16 once more than the unsplit reference.
-    atol = 1e-3 if num_splits == 1 else 4e-3
+    # SplitKV rounds the fp32 combine to bf16 once more than the unsplit reference, and decode
+    # (seqlen_q=1) runs the swapped-operand kernel, which rounds differently from the reference.
+    atol = 1e-3 if num_splits == 1 and seqlen_q > 1 else 4e-3
     assert torch.allclose(out_paged, out_ref, atol=atol, rtol=1e-3), (
         "Paged seqused_k output does not match the dense varlen reference"
     )
