@@ -283,11 +283,10 @@ class FlashAttentionBackwardSm100:
         # LSE_stage = Q_stage and dPsum_stage = dO_stage
         self.sdKVaccum_stage = 2
         # number of tma reduce adds per dQacc mma
-        # todo: try 32/1 or 48/2 for 2cta d=192 dv=128
         if self.use_2cta_instrs and self.tile_hdim == 192:
             self.dQ_reduce_ncol_t2r = 32
-            self.dQ_reduce_ncol = 24 if not self.is_causal else 32
-            self.sdQaccum_stage = 2 if not self.is_causal else 1
+            self.dQ_reduce_ncol = 24
+            self.sdQaccum_stage = 2
         else:
             if self.use_2cta_instrs:
                 self.dQ_reduce_ncol = 16 if self.deterministic else 8
