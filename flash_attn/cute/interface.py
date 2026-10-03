@@ -2395,6 +2395,11 @@ def _flash_attn_bwd(
         cluster_size = 2 if use_2cta_instrs else 1
 
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+    if use_dedicated_hd256_kernel and utils._get_hd256_fused_bwd_default():
+        # Fused general backward: 64 K rows per CTA, so all five accumulators fit TMEM.
+        use_dedicated_hd256_kernel = False
+        m_block_size, n_block_size = 128, 64
+        use_2cta_instrs, cluster_size = True, 2
     if (
         use_dedicated_hd256_kernel
         or (arch // 10 in [10, 11] and cu_seqlens_q is not None)
@@ -3086,13 +3091,21 @@ def _flash_attn_bwd(
         )
 
         if dKV_postprocess:
+            # hdim 256 writes dK / dV per 2-CTA cluster tile in dQ's order (see
+            # epilogue_dKV_accum_hd256), so they decode like dQ.
+            if head_dim == 256:
+                dKV_block_size = cluster_size * n_block_size
+                dKV_kwargs = dict(use_2cta_instrs=True, cluster_size=1)
+            else:
+                dKV_block_size = n_block_size
+                dKV_kwargs = dict(cluster_size=cluster_size)
             # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
             _bwd_postprocess_convert(
                 dk_accum, dk, softmax_scale,
                 cu_seqlens_k, seqused_k,
-                arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
+                arch, dtype, head_dim, dKV_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
-                cluster_size=cluster_size,
+                **dKV_kwargs,
                 cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
                 fake_mode=fake_mode,
                 hdim_multiple_of=hdim_multiple_of,
@@ -3101,9 +3114,9 @@ def _flash_attn_bwd(
             _bwd_postprocess_convert(
                 dv_accum, dv, 1.0,
                 cu_seqlens_k, seqused_k,
-                arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
+                arch, dtype, head_dim_v, dKV_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
-                cluster_size=cluster_size,
+                **dKV_kwargs,
                 cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
                 fake_mode=fake_mode,
                 hdim_multiple_of=hdim_multiple_of,
