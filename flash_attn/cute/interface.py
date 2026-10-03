@@ -83,8 +83,11 @@ BIN_BATCH_SEARCH_THRESH = 256  # above this batch size SingleTileVarlenScheduler
 # Where the cu hint applies, use an O(1) flat-block -> batch lookup instead of the binary search.
 USE_BLOCKS_TO_BATCH: bool = True
 
-# Minimum KV blocks per split for S ping-pong; hd256 SplitKV stays disabled.
+# Minimum KV blocks per split for S ping-pong; hd256 SplitKV only gets it with fixed splits (seqlen_k_per_split).
 S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT = {64: 16, 128: 64}
+# Fixed-size splits (seqlen_k_per_split) keep fp32 partials of (num_splits, total_q, H, D_v);
+# longer varlen calls run in query chunks so the partials stay under this budget.
+FIXED_SPLIT_PARTIAL_BUDGET_BYTES = 4 << 30
 
 
 def _parse_arch_str(arch_str):
@@ -674,6 +677,40 @@ def _mla_fwd_plan(
 
 
 
+def _fixed_split_fwd_in_q_chunks(
+    q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, chunk_rows, **kwargs
+):
+    """Run a causal varlen fixed-split forward over row chunks of q, writing into out/lse.
+
+    Each chunk keeps every row's KV range: rows [a, b) of a document attend causally to its
+    first len_k - len_q + b keys (seqused_k), bottom-right aligned. The KV partition is at
+    absolute positions, so each row gets the same bits as in one call.
+    """
+    total_q = q.shape[0]
+    len_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    len_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    for row_start in range(0, total_q, chunk_rows):
+        row_end = min(row_start + chunk_rows, total_q)
+        cu_seqlens_q_chunk = cu_seqlens_q.clamp(row_start, row_end) - row_start
+        rows_end_in_doc = (row_end - cu_seqlens_q[:-1]).clamp(min=0).minimum(len_q)
+        seqused_k = (len_k - len_q + rows_end_in_doc).clamp(min=0).to(torch.int32)
+        _, lse_chunk, *_ = _flash_attn_fwd(
+            q[row_start:row_end],
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens_q_chunk,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_k=seqused_k,
+            max_seqlen_q=min(max_seqlen_q, row_end - row_start),
+            out=out[row_start:row_end],
+            return_lse=lse is not None,
+            **kwargs,
+        )
+        if lse is not None:
+            lse[:, row_start:row_end] = lse_chunk
+    return out, lse, None, None, None
+
+
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -892,6 +929,39 @@ def _flash_attn_fwd(
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
         validate_output_layout(lse, "lse", align_bytes=4)
+
+    partial_bytes = num_splits * total_q * num_head * head_dim_v * 4
+    if (
+        seqlen_k_per_split is not None
+        and partial_bytes > FIXED_SPLIT_PARTIAL_BUDGET_BYTES
+        and cu_seqlens_q is not None
+        and cu_seqlens_k is not None
+        and seqused_q is None
+        and seqused_k is None
+        and page_table is None
+        and causal
+        and qv is None
+        and not fake_mode
+        and not torch.is_tensor(max_seqlen_q)
+        and scheduler_metadata is None
+        and not disable_scheduler_metadata
+        and not gather_bwd_recompute_p
+        and all(
+            x is None
+            for x in (min_seqlen_k, softcap, window_size_left, window_size_right, learnable_sink,
+                      score_mod, mask_mod, block_sparse_tensors, aux_tensors, gather_kv_indices,
+                      q_descale)
+        )
+    ):
+        chunk_rows = max(1, FIXED_SPLIT_PARTIAL_BUDGET_BYTES // (num_splits * num_head * head_dim_v * 4))
+        return _fixed_split_fwd_in_q_chunks(
+            q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k,
+            total_q if max_seqlen_q is None else max_seqlen_q, chunk_rows,
+            max_seqlen_k=max_seqlen_k, softmax_scale=softmax_scale, causal=True,
+            tile_mn=tile_mn, mma_pv_is_rs=mma_pv_is_rs, intra_wg_overlap=intra_wg_overlap,
+            num_threads=num_threads, num_splits=num_splits, pack_gqa=pack_gqa, _arch=_arch,
+            seqlen_k_per_split=seqlen_k_per_split,
+        )
 
     if seqlen_k == 0 or total_q == 0:
         out.zero_()
@@ -1444,6 +1514,14 @@ def _flash_attn_fwd(
         and (
             num_splits == 1
             or num_n_blocks_per_split >= S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT.get(head_dim, math.inf)
+            # Fixed hd256 splits: S ping-pong pays off for multi-tile Q (prefill, training),
+            # not for decode.
+            or (
+                head_dim == 256
+                and seqlen_k_per_split is not None
+                and not torch.is_tensor(max_m_blocks_leq_one)
+                and not max_m_blocks_leq_one
+            )
         )
     )
 
