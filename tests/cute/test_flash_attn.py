@@ -1127,6 +1127,55 @@ def test_flash_attn_hd256_sm100_deterministic_backward(causal, nheads, nheads_kv
             assert torch.equal(grad, grad_first)
 
 
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads,nheads_kv", [(4, 4), (16, 4)])
+def test_flash_attn_hd256_sm100_fused_backward(nheads, nheads_kv, causal, varlen, monkeypatch):
+    """FA_HD256_FUSED_BWD: grads as accurate as two-kernel; deterministic mode is bitwise."""
+    if not IS_SM100:
+        pytest.skip("SM100-specific hd256 backward test")
+    import flash_attn.cute.utils as fa_utils
+
+    torch.random.manual_seed(0)
+    seqlens = [1000, 77] if varlen else [777, 777]
+    kw = dict(device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    q = torch.randn(sum(seqlens), nheads, 256, **kw)
+    k = torch.randn(sum(seqlens), nheads_kv, 256, **kw)
+    v = torch.randn_like(k, requires_grad=True)
+    dout = torch.randn_like(q)
+    cu_seqlens = torch.tensor([0, *itertools.accumulate(seqlens)], device="cuda", dtype=torch.int32)
+
+    def grads(fused, deterministic=False):
+        monkeypatch.setattr(fa_utils, "_fa_hd256_fused_bwd_enabled", fused)
+        if varlen:
+            out, _ = flash_attn_varlen_func(
+                q, k, v, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens), causal=causal,
+                deterministic=deterministic,
+            )
+        else:
+            batch = lambda t: t.view(len(seqlens), seqlens[0], *t.shape[1:])
+            out, _ = flash_attn_func(
+                batch(q), batch(k), batch(v), causal=causal, deterministic=deterministic
+            )
+            out = out.view_as(q)
+        return torch.autograd.grad(out, (q, k, v), dout)
+
+    refs = [torch.zeros_like(t, dtype=torch.float32) for t in (q, k, v)]
+    for start, end in zip(cu_seqlens.tolist(), cu_seqlens.tolist()[1:]):
+        args = [t[start:end].unsqueeze(0).detach().float().requires_grad_() for t in (q, k, v)]
+        out_ref, _ = attention_ref(*args, causal=causal)
+        grads_ref = torch.autograd.grad(out_ref, args, dout[start:end].unsqueeze(0))
+        for ref, grad in zip(refs, grads_ref):
+            ref[start:end] = grad[0]
+    for fused, two_kernel, ref in zip(grads(True), grads(False), refs):
+        err, err_two_kernel = ((g.float() - ref).abs().max() for g in (fused, two_kernel))
+        assert err <= 2 * err_two_kernel + 1e-3
+    first, second = grads(True, deterministic=True), grads(True, deterministic=True)
+    for a, b in zip(first, second):
+        assert torch.equal(a, b)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("layout", ["padded", "transposed"])
