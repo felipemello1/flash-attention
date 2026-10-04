@@ -1089,6 +1089,9 @@ def _flash_attn_fwd(
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
         and (
             is_hdim256
+            # (192, 128) causal: 2CTA is bitwise equal and faster from 8k rows; shorter rows and
+            # local windows are even or slower (threshold tuned on GB300 with 16 and 128 heads).
+            or (head_dim == 192 and head_dim_v == 128 and causal and not local and seqlen_q >= 8192)
             or (
                 not causal
                 and not local
