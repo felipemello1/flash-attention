@@ -524,6 +524,53 @@ def test_hd256_clc_requires_host_maximum(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Many short causal sequences: persistent 1CTA grid instead of 2CTA.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_heads_q", [16, 24], ids=["gqa4", "gqa6"])
+def test_hd256_short_causal_batch_persistent_1cta(num_heads_q, monkeypatch):
+    """A batch of short causal sequences runs on the persistent 1CTA grid and each sequence
+    alone on 2CTA; both give the same rows bitwise."""
+    fwd_cls = interface.FlashAttentionForwardSm100
+    routes = []
+
+    def record_route(*args, **kwargs):
+        routes.append((kwargs["use_2cta_instrs"], kwargs["use_clc_scheduler"]))
+        return fwd_cls(*args, **kwargs)
+
+    monkeypatch.setattr(interface, "FlashAttentionForwardSm100", record_route)
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", JITCache())
+    q_lens = (512,) * 15 + (300,)
+    q, k, v, _ = make_inputs(q_lens, q_lens, torch.bfloat16, num_heads_q=num_heads_q, num_heads_kv=4)
+
+    def forward(first, last):
+        """Sequences [first, last) as one varlen batch."""
+        lens = q_lens[first:last]
+        lo, hi = sum(q_lens[:first]), sum(q_lens[:last])
+        cu = make_cu_seqlens(lens)
+        with torch.no_grad():
+            out, _ = flash_attn_varlen_func(
+                q[lo:hi],
+                k[lo:hi],
+                v[lo:hi],
+                cu_seqlens_q=cu,
+                cu_seqlens_k=cu,
+                max_seqlen_q=max(lens),
+                max_seqlen_k=max(lens),
+                causal=True,
+            )
+        return out
+
+    batch = forward(0, len(q_lens))
+    first, last = forward(0, 1), forward(len(q_lens) - 1, len(q_lens))
+    assert routes == [(False, True), (True, False)], routes
+    assert torch.equal(batch[: q_lens[0]], first)
+    assert torch.equal(batch[-q_lens[-1] :], last)
+    check_against_reference((batch,), q, k, v, None, q_lens, q_lens, True, torch.bfloat16)
+
+
+# ---------------------------------------------------------------------------
 # Opt-in stress: random ragged batches with empty slots, MQA and GQA.
 # ---------------------------------------------------------------------------
 

@@ -1077,9 +1077,37 @@ def _flash_attn_fwd(
         lse_partial = torch.empty(num_splits, *lse_partial_shape, dtype=torch.float32, device=device)
         lse_partial_kernel = lse_partial if qv is None else lse_partial.transpose(-1, -2)
 
+    # hd256 causal picks one of two routes (CLC can't schedule hd256 2CTA tiles):
+    #   2CTA:            a CTA pair shares each K/V load; wins when Q tiles read many KV blocks.
+    #   persistent 1CTA: CLC keeps each CTA looping over tiles; wins with many short tiles.
+    # Take 1CTA when an SM gets at least as many Q tiles as a Q tile reads KV blocks. On average a
+    # causal Q tile reads max_seqlen_k - max_seqlen_q / 2 keys. GB300, 128 x 128 tiles:
+    #   24 heads, b16 x 512 new, 0 cached:   10 Q tiles per SM >= 2 KV blocks   -> 1CTA
+    #   24 heads, b16 x 512 new, 8k cached:  10 Q tiles per SM < 66 KV blocks   -> 2CTA
+    #   16 heads, b4 x 512 new, 0 cached:    1.7 Q tiles per SM < 2 KV blocks   -> 2CTA
+    q_tiles_per_sm = total_q * num_head / tile_m / num_sms
+    kv_blocks_per_q_tile = (max_seqlen_k - max_seqlen_q / 2) / tile_n
+    # PackGQA with cp.async Q (128 % qhead_per_kvhead != 0) gains from CLC only with at least
+    # 8 Q tiles per SM. 24 heads, with CLC: 16 x 130 prefill 35 -> 39 us, 128 x 64 112 -> 103.
+    min_q_tiles_per_sm = 8 if pack_gqa and tile_m % qhead_per_kvhead != 0 else 0
+    hd256_persistent_1cta = (
+        arch // 10 in [10, 11]
+        and is_hdim256
+        and causal
+        and qhead_per_kvhead > 1  # measured on GQA; CLC stays off for varlen MHA
+        and not is_fp8
+        and not is_split_kv
+        and not use_block_sparsity
+        and seqused_q is None
+        and scheduler_metadata is None
+        and page_size in [None, tile_n]  # CLC needs TMA K/V
+        and q_tiles_per_sm >= max(kv_blocks_per_q_tile, min_q_tiles_per_sm)
+    )
+
     use_2cta_instrs = (
         arch // 10 in [10, 11]
         and not requested_disable_2cta
+        and not hd256_persistent_1cta
         and not is_split_kv
         and (cu_seqlens_q is None or (is_hdim256 and hd256_2cta_varlen_ok))
         and seqused_q is None
@@ -1122,7 +1150,7 @@ def _flash_attn_fwd(
     is_varlen_mha = is_varlen and qhead_per_kvhead == 1
     is_dense_noncausal = not is_varlen and not causal and not local
     use_clc_scheduler = (
-        requested_use_clc_scheduler
+        (requested_use_clc_scheduler or hd256_persistent_1cta)
         and not is_varlen_mha
         and not is_dense_noncausal
         # CLC does not map hd256 2CTA tiles correctly (wrong output, traps, hangs).
