@@ -524,6 +524,60 @@ def test_hd256_clc_requires_host_maximum(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 24 Q / 4 KV heads: 128 % 6 != 0, so PackGQA runs 1CTA and competes with 2CTA.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "q_lens, k_lens, prefer_pack",
+    [
+        # Each case's faster layout on GB300, in us with 2CTA vs PackGQA.
+        # A prefill chunk plus 31 decodes: 998 vs 451.
+        pytest.param((2048,) + (1,) * 31, (10240,) + (8192,) * 31, True, id="chunk_31_decodes"),
+        # 3 decodes fit in one wave of 2CTA clusters: 131 vs 158.
+        pytest.param((2048,) + (1,) * 3, (2048,) + (8192,) * 3, False, id="chunk_3_decodes"),
+        # The long chunk dominates: 1401 vs 1505.
+        pytest.param((8192,) + (1,) * 8, (16384,) + (8192,) * 8, False, id="long_chunk_8_decodes"),
+        # Short prompts: 110 vs 69.
+        pytest.param((300,) * 16, (300,) * 16, True, id="short_prompts"),
+        # Long prompts: 361 vs 373.
+        pytest.param((2048,) * 8, (2048,) * 8, False, id="long_prompts"),
+    ],
+)
+def test_hd256_short_requests_prefer_pack_gqa(q_lens, k_lens, prefer_pack):
+    assert interface._hd256_short_requests_prefer_pack_gqa(
+        len(q_lens), sum(q_lens), max(q_lens), max(k_lens),
+        num_head=24, qhead_per_kvhead=6, num_sms=152,
+    ) == prefer_pack
+
+
+def test_hd256_mixed_batch_runs_pack_gqa(monkeypatch):
+    """A prefill chunk plus decodes runs PackGQA, and its output is bitwise the 2CTA one."""
+    q_lens, k_lens = (2048,) + (1,) * 31, (2048,) + (1024,) * 31
+    dtype = torch.bfloat16
+    q, k, v, _ = make_inputs(q_lens, k_lens, dtype, num_heads_q=24, num_heads_kv=4)
+    cu_q, cu_k = make_cu_seqlens(q_lens), make_cu_seqlens(k_lens)
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", JITCache())
+    constructor = Mock(wraps=interface.FlashAttentionForwardSm100)
+    monkeypatch.setattr(interface, "FlashAttentionForwardSm100", constructor)
+
+    def forward(pack_gqa):
+        with torch.no_grad():
+            out, _ = flash_attn_varlen_func(
+                q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=max(q_lens),
+                max_seqlen_k=max(k_lens), causal=True, pack_gqa=pack_gqa,
+            )
+        return out, constructor.call_args.kwargs
+
+    out_default, kwargs = forward(None)
+    assert kwargs["pack_gqa"] and not kwargs["use_2cta_instrs"]
+    out_2cta, kwargs = forward(False)
+    assert kwargs["use_2cta_instrs"]
+    assert torch.equal(out_default, out_2cta)
+    check_against_reference((out_default,), q, k, v, None, q_lens, k_lens, True, dtype)
+
+
+# ---------------------------------------------------------------------------
 # Opt-in stress: random ragged batches with empty slots, MQA and GQA.
 # ---------------------------------------------------------------------------
 
