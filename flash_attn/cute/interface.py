@@ -1059,28 +1059,15 @@ def _flash_attn_fwd(
     seqlen_q_packgqa = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
     max_m_blocks_leq_one = seqlen_q_packgqa <= q_stage * tile_m
 
-    is_split_kv = num_splits > 1
     # Single-M-block hd256 2CTA halves each CTA's K/V loads; worth it while the doubled
     # grid fits in one wave.
     hd256_decode_2cta = (
         is_hdim256 and 2 * batch_size * (num_head_kv if pack_gqa else num_head) <= num_sms
     )
-    if is_split_kv:
-        out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
-        # Combine needs LSE partials seqlen-contiguous, (..., h, s); the MLA kernels take
-        # (..., s, h) modes, so they get a transposed view (their LSE writes are scatters).
-        lse_partial_shape = (
-            lse_shape
-            if qv is None
-            else ((batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q))
-        )
-        lse_partial = torch.empty(num_splits, *lse_partial_shape, dtype=torch.float32, device=device)
-        lse_partial_kernel = lse_partial if qv is None else lse_partial.transpose(-1, -2)
-
-    use_2cta_instrs = (
+    # Whether the unsplit kernel could use 2CTA; any split turns 2CTA off (see use_2cta_instrs).
+    can_use_2cta = (
         arch // 10 in [10, 11]
         and not requested_disable_2cta
-        and not is_split_kv
         and (cu_seqlens_q is None or (is_hdim256 and hd256_2cta_varlen_ok))
         and seqused_q is None
         and not use_block_sparsity
@@ -1097,6 +1084,35 @@ def _flash_attn_fwd(
             )
         )
     )
+    # TODO: with 128 % qhead_per_kvhead != 0 (e.g. 24 Q / 4 KV heads) and max_seqlen_q <= 128,
+    # auto keeps PackGQA, which can't run 2CTA, so this check never runs. An explicit
+    # num_splits=1 turns PackGQA off for 2CTA (the PackGQA gate above); doing the same when one
+    # split wins here would take b1 decode on 256 keys from 24.7 to 14.8 us on GB300.
+    if num_splits_auto and is_hdim256 and can_use_2cta and num_splits > 1:
+        # At hd256, splitting turns off 2CTA and S ping-pong. Estimated time, in K/V blocks
+        # of the unsplit kernel:
+        #   one split:   num_n_blocks
+        #   split:       1.5 * num_n_blocks / num_splits + 12
+        #                (each block ~1.5x slower; the prepare and combine kernels ~12 blocks)
+        # e.g. 512 new tokens on 2k cached (20 blocks), auto picks 2 splits: 20 vs 27, so keep
+        # one split. Decode on 8k (64 blocks), auto picks 38 splits: 64 vs 15, so split.
+        num_n_blocks = cute.ceil_div(max_seqlen_k, tile_n)
+        if 1.5 * num_n_blocks / num_splits + 12 >= num_n_blocks:
+            num_splits = 1
+    is_split_kv = num_splits > 1
+    if is_split_kv:
+        out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
+        # Combine needs LSE partials seqlen-contiguous, (..., h, s); the MLA kernels take
+        # (..., s, h) modes, so they get a transposed view (their LSE writes are scatters).
+        lse_partial_shape = (
+            lse_shape
+            if qv is None
+            else ((batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q))
+        )
+        lse_partial = torch.empty(num_splits, *lse_partial_shape, dtype=torch.float32, device=device)
+        lse_partial_kernel = lse_partial if qv is None else lse_partial.transpose(-1, -2)
+
+    use_2cta_instrs = can_use_2cta and not is_split_kv
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"

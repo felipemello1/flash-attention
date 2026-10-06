@@ -91,6 +91,21 @@ def test_flash_attn_auto_splits_more_tiles_than_sms():
     assert torch.equal(out, ref)
 
 
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 SplitKV heuristic")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hd256_auto_splits_short_kv():
+    """With a short KV, hd256 auto keeps one split: 2 splits would lose 2CTA and S ping-pong."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 512, 16, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 2560, 4, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    out, _ = flash_attn_func(q, k, v, causal=True, num_splits=0)
+    ref, _ = flash_attn_func(q, k, v, causal=True, num_splits=1)
+    if is_fake_mode():
+        return
+    assert torch.equal(out, ref)
+
+
 @pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
 def test_flash_attn_sm120_rejects_splitkv():
     q = torch.randn(1, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
