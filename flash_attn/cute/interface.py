@@ -328,6 +328,50 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     return max(1, min(num_SMs // total_mblocks, max_splits, num_n_blocks))
 
 
+def _hd256_short_requests_prefer_pack_gqa(
+    batch_size, total_q, max_seqlen_q, max_seqlen_k, num_head, qhead_per_kvhead, num_sms
+):
+    """Whether a varlen batch of mostly short requests should use PackGQA instead of 2CTA.
+
+    Only used when 128 % qhead_per_kvhead != 0 (e.g. 24 Q / 4 KV heads), where PackGQA can't run
+    2CTA. A short request wastes most of a 2CTA tile:
+
+        one decode (1 query token), 24 Q heads on 4 KV heads:
+          2CTA:     a 256-row CTA pair per Q head    -> 24 x 2 = 48 CTAs, 1 real row each
+          PackGQA:  one 128-row CTA per KV head      ->  4 CTAs, 6 real rows each (its 6 Q heads)
+
+    PackGQA wins when both hold:
+    (a) 2CTA needs more than 1.25x as many CTAs as PackGQA (1.1x with no KV cache, where 2CTA
+        gains less).
+    (b) The short requests alone need more than one wave of 2CTA CTAs. Within one wave, 2CTA
+        finishes them sooner, since each CTA of a pair loads half the KV.
+
+    The host only knows the longest request, so the others are assumed to split the remaining
+    tokens evenly.
+
+    Example (24 Q / 4 KV heads, 152 SMs), a 2048-token prefill chunk + 31 decodes:
+
+                  prefill chunk                  31 decodes           total
+        2CTA:     24 x 2 x (2048 / 256)   = 384  + 31 x 24 x 2 = 1488  = 1872 CTAs
+        PackGQA:   4 x (2048 x 6 / 128)   = 384  + 31 x 4      =  124  =  508 CTAs
+
+        (a) 1872 > 1.25 x 508 and (b) 1488 > 152, so PackGQA.
+        With 3 decodes instead, (b) fails (3 x 24 x 2 = 144 <= 152), so 2CTA.
+    """
+    num_short = min(batch_size - 1, total_q - max_seqlen_q)
+    if num_short <= 0:
+        return False
+    short_len = (total_q - max_seqlen_q) / num_short
+    short_ctas_2cta = num_short * num_head * 2 * math.ceil(short_len / 256)
+    ctas_2cta = num_head * 2 * math.ceil(max_seqlen_q / 256) + short_ctas_2cta
+    ctas_pack = num_head // qhead_per_kvhead * (
+        math.ceil(max_seqlen_q * qhead_per_kvhead / 128)
+        + num_short * math.ceil(short_len * qhead_per_kvhead / 128)
+    )
+    min_ratio = 1.25 if max_seqlen_k > max_seqlen_q else 1.1
+    return short_ctas_2cta > num_sms and ctas_2cta > min_ratio * ctas_pack
+
+
 def _get_fwd_config(
     *,
     arch: int,
@@ -1006,8 +1050,11 @@ def _flash_attn_fwd(
             and hd256_2cta_varlen_ok
             and (max_seqlen_q > 128 or (num_splits == 1 and 2 * batch_size * num_head <= num_sms))
         ):
-            # Prefer 2CTA over cp.async-Q PackGQA for hd256.
-            pack_gqa = False
+            # Prefer 2CTA over cp.async-Q PackGQA for hd256, unless a varlen batch is mostly
+            # short requests, where 2CTA's 256-row padding costs more than it gains.
+            pack_gqa = cu_seqlens_q is not None and _hd256_short_requests_prefer_pack_gqa(
+                batch_size, total_q, max_seqlen_q, max_seqlen_k, num_head, qhead_per_kvhead, num_sms
+            )
 
     fwd_cfg = _get_fwd_config(
         arch=arch,
