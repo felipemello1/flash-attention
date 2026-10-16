@@ -91,6 +91,22 @@ def test_flash_attn_auto_splits_more_tiles_than_sms():
     assert torch.equal(out, ref)
 
 
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 decode scheduler")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_decode_persistent_grid_matches_small_batch():
+    """Decode with 3+ waves of long-KV tiles runs a persistent grid; rows match a small batch."""
+    torch.manual_seed(0)
+    # 160 x 4 kv heads = 640 tiles of 64 key blocks: the persistent grid. 8 x 4 = 32: not.
+    q = torch.randn(160, 1, 32, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(160, 8192, 4, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    out, _ = flash_attn_func(q, k, v, causal=True, num_splits=1)
+    ref, _ = flash_attn_func(q[:8], k[:8], v[:8], causal=True, num_splits=1)
+    if is_fake_mode():
+        return
+    assert torch.equal(out[:8], ref)
+
+
 @pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
 @pytest.mark.parametrize("num_splits", [0, -1])
 def test_flash_attn_sm120_num_splits(num_splits):
