@@ -1122,8 +1122,19 @@ def _flash_attn_fwd(
     # pays work-stealing overhead.
     is_varlen_mha = is_varlen and qhead_per_kvhead == 1
     is_dense_noncausal = not is_varlen and not causal and not local
+    # Decode with 3+ waves of long-KV tiles: a persistent grid pays each CTA's setup once
+    # instead of once per tile (head dim 64, batch 256 x 32k: -4.6%). Shorter KV, windows,
+    # splits or fewer waves lose more to work stealing than they save.
+    decode_many_long_tiles = (
+        qv is None  # the MLA kernels own their CLC policy
+        and max_m_blocks_leq_one
+        and not is_split_kv
+        and not local
+        and batch_size * (num_head_kv if pack_gqa else num_head) >= 3 * num_sms
+        and cute.ceil_div(max_seqlen_k, tile_n) >= 64
+    )
     use_clc_scheduler = (
-        requested_use_clc_scheduler
+        (requested_use_clc_scheduler or decode_many_long_tiles)
         and not is_varlen_mha
         and not is_dense_noncausal
         # CLC does not map hd256 2CTA tiles correctly (wrong output, traps, hangs).
