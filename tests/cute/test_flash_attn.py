@@ -3150,13 +3150,14 @@ def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
 
 
 @pytest.mark.parametrize("varlen_q", [False, True])
-@pytest.mark.parametrize("num_splits", [1, 0])
+@pytest.mark.parametrize("num_splits", [1, 0, 2])
 @pytest.mark.parametrize("nheads,nheads_kv", [(16, 4), (24, 4)])
 def test_flash_attn_hd256_sm100_decode_swap_ab(
     nheads, nheads_kv, num_splits, varlen_q, monkeypatch
 ):
-    """Paged hd256 decode on the swapped-operand kernel: matches an fp32 reference, and with
-    num_splits=1 a sequence's output is bitwise the same alone or inside a batch."""
+    """Paged hd256 decode on the swapped-operand kernel: matches an fp32 reference, and with a
+    fixed num_splits a sequence's output is bitwise the same alone or inside a batch.
+    num_splits=1 stays on the general path."""
     if not IS_SM100:
         pytest.skip("SM100-specific decode kernel")
     import flash_attn.cute.interface as fa_interface
@@ -3217,13 +3218,13 @@ def test_flash_attn_hd256_sm100_decode_swap_ab(
             assert (out[b].float() - out_ref).abs().max().item() < 1e-2
             assert (lse[b] - torch.logsumexp(s, dim=-1)).abs().max().item() < 1e-3
 
-        if num_splits == 1 and bs > 1:
+        if num_splits == 2 and bs > 1:
             sub = [1, 0, bs - 1]
             out_sub, lse_sub = run(
                 q[sub], k_cache, v_cache, [seqlens_k[b] for b in sub], page_table[sub]
             )
             assert torch.equal(out_sub, out[sub]) and torch.equal(lse_sub, lse[sub])
-    assert calls, "decode did not route to the swapped-operand kernel"
+    assert bool(calls) == (num_splits != 1), calls
 
 
 @pytest.mark.parametrize("head_dim", [128, 256])
@@ -3398,9 +3399,8 @@ def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q,
     assert out_paged.abs().max().item() < 10.0, (
         "Paged seqused_k output has poison-scale magnitudes: KV past seqused_k leaked"
     )
-    # SplitKV rounds the fp32 combine to bf16 once more than the unsplit reference, and decode
-    # (seqlen_q=1) runs the swapped-operand kernel, which rounds differently from the reference.
-    atol = 1e-3 if num_splits == 1 and seqlen_q > 1 else 4e-3
+    # SplitKV rounds the fp32 combine to bf16 once more than the unsplit reference.
+    atol = 1e-3 if num_splits == 1 else 4e-3
     assert torch.allclose(out_paged, out_ref, atol=atol, rtol=1e-3), (
         "Paged seqused_k output does not match the dense varlen reference"
     )

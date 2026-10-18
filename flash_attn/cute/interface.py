@@ -54,7 +54,7 @@ from flash_attn.cute.flash_bwd_postprocess import (
     DSinkReduceKernel,
 )
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
-from flash_attn.cute.flash_fwd_decode_sm100 import FlashAttentionDecodeSwappedSm100
+from flash_attn.cute.flash_fwd_decode_paged_sm100 import FlashAttentionDecodeSwappedSm100
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
 from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
@@ -678,8 +678,8 @@ def _mla_fwd_plan(
 def _decode_swap_ab_num_splits(
     num_splits: int, batch_size: int, num_head_kv: int, max_seqlen_k: int, num_sms: int
 ) -> int:
-    """Splits for FlashAttentionDecodeSwappedSm100. num_splits >= 1 is kept (1 is batch
-    invariant). Auto fills the SMs, with at most 16 splits and at least 4 key blocks each:
+    """Splits for FlashAttentionDecodeSwappedSm100. An explicit num_splits is kept (1 never
+    routes here). Auto fills the SMs, with at most 16 splits and at least 4 key blocks each:
     shared-prefix decode is latency-bound and needs the CTAs (GB300 bs16 x 32k shared:
     238 us at 1 split, 131 at 2), while distinct pages are HBM-bound from ~64 CTAs on."""
     if num_splits >= 1:
@@ -1063,6 +1063,8 @@ def _flash_attn_fwd(
     seqlen_q_known = seqlen_q if cu_seqlens_q is None else host_max_seqlen_q
 
     # GQA decode with swapped MMA operands: one query token per sequence, hd256, paged KV.
+    # num_splits=1 keeps the general path, whose decode rounds like a prefill of the same
+    # token (train/inference parity tests rely on it); this kernel can differ by 2 bf16 steps.
     if (
         arch // 10 == 10
         and q is not None
@@ -1088,6 +1090,7 @@ def _flash_attn_fwd(
         and gather_kv_indices is None
         and seqlen_k_per_split is None
         and scheduler_metadata is None
+        and num_splits != 1
         and not utils._get_disable_decode_swap_ab_default()
     ):
         _flash_attn_fwd_decode_swap_ab(
