@@ -143,8 +143,8 @@ def select_swapab_backend(
     if any(t.stride(-1) != 1 for t in (q, k, v)):
         return reject("contiguous head dimension")
     if page_table is not None:
-        if k.shape[1] < 256 or k.shape[1] % 256:
-            return reject("page size must be divisible by 256")
+        if k.shape[1] < 128 or k.shape[1] % 128:
+            return reject("page size must be divisible by 128")
         capacity = page_table.shape[1] * k.shape[1]
     else:
         batch_size = request["cu_seqlens_q"].shape[0] - 1 if varlen_q else q.shape[0]

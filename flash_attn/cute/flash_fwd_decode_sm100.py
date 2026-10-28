@@ -73,6 +73,7 @@ class _SwapABCore:
         mask_mod=None,
         is_local=False,
         head_dim_v=None,
+        block_spans_pages=False,
     ):
         self.tile_hq = tile_hq
         self.tile_n = tile_n
@@ -84,6 +85,7 @@ class _SwapABCore:
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.is_local = is_local
+        self.block_spans_pages = block_spans_pages
         self.check_empty_rows = score_mod is not None or mask_mod is not None or is_local
 
         assert head_dim > 0 and head_dim % 16 == 0
@@ -616,26 +618,46 @@ class _SwapABCore:
 
             # Producer for the shared ring. Loop iteration s pushes K(s) and V(s - lookahead), so the
             # stream is K0 K1 K2 | V0 K3 V1 ... and finally the trailing V tiles V(N-3) V(N-2) V(N-1).
+            # A 256-key block spans two pages when the page size is not a multiple of 256
+            # (block_spans_pages): each 128-token half then reads its own page; otherwise one read
+            # covers the block. All reads of an iteration come before its copies. Halves outside
+            # [0, seqlen_k) read the last valid half's page instead (the table may be only
+            # cdiv(seqlen_k, page_size) wide); their keys are masked. A guarded read (`valid=`)
+            # was ~7% slower than this clamped one at hd64 (GB300).
             kv_tiler = (tile_m, tile_k)
             kv_token = cutlass.Boolean(True)
+            if const_expr(mPageTable is not None):
+                page_size = cute.FastDivmodDivisorV2(mK.shape[0])
+                page_row = mPageTable[batch_idx, None]
+                last_half_start = cutlass.max(seqlen_k - 1, 0) // tile_m * tile_m
             for s in cutlass.range(split_id, kv_lookahead_blocks + num_n_blocks, num_splits):
+                k_start = (s + n_block_min) * tile_n
+                v_start = (s - kv_lookahead_blocks + n_block_min) * tile_n
+                k_pages, v_pages = [], []  # (page, offset in the page) per 128-token half
+                if const_expr(mPageTable is not None):
+                    for half in cutlass.range_constexpr(num_s_subtiles):
+                        if const_expr(half == 0 or self.block_spans_pages):
+                            k_half_start = cutlass.max(
+                                cutlass.min(k_start + half * tile_m, last_half_start), 0
+                            )
+                            v_half_start = cutlass.max(
+                                cutlass.min(v_start + half * tile_m, last_half_start), 0
+                            )
+                            k_pages.append(resolve_paged_token(page_row, k_half_start, page_size))
+                            v_pages.append(resolve_paged_token(page_row, v_half_start, page_size))
+                        else:
+                            k_pages.append((k_pages[0][0], k_pages[0][1] + half * tile_m))
+                            v_pages.append((v_pages[0][0], v_pages[0][1] + half * tile_m))
                 if s < num_n_blocks:
-                    k_block, k_bh = s + n_block_min, bh_idx
-                    if const_expr(mPageTable is not None):
-                        page, offset = resolve_paged_token(
-                            mPageTable[bh_idx // num_heads_kv, None],
-                            k_block * tile_n,
-                            mK.shape[0],
-                        )
-                        page = cute.arch.make_warp_uniform(page)
-                        offset = cute.arch.make_warp_uniform(offset)
-                        k_block = offset // tile_n
-                        k_bh = page * num_heads_kv + bh_idx % num_heads_kv
-                    k_block_coord = (k_block, 0, k_bh)
-                    gK = cute.local_tile(mK, (tile_n, hdim), k_block_coord)
-                    gK_blk = cute.zipped_divide(gK, kv_tiler)
                     for sm in cutlass.range_constexpr(num_s_subtiles):
-                        gK_sub = gK_blk[(None, None), (sm, None)]
+                        k_token, k_bh = k_start + sm * tile_m, bh_idx
+                        if const_expr(mPageTable is not None):
+                            page, k_offset = k_pages[sm]
+                            page = cute.arch.make_warp_uniform(page)
+                            k_token = cute.arch.make_warp_uniform(k_offset)
+                            k_bh = page * num_heads_kv + bh_idx % num_heads_kv
+                        gK = cute.local_tile(mK, (tile_m, hdim), (k_token // tile_m, 0, k_bh))
+                        gK_sub = cute.zipped_divide(gK, kv_tiler)[(None, None), (0, None)]
                         tKgK = thr_mma_qk.partition_A(gK_sub)
                         for dk in cutlass.range_constexpr(num_k_tiles):
                             gK_cur = tKgK[None, None, None, dk]
@@ -649,22 +671,18 @@ class _SwapABCore:
                             kv_token = pipeline_kv.producer_try_acquire()
 
                 if s >= kv_lookahead_blocks:
-                    v_block, v_bh = s - kv_lookahead_blocks + n_block_min, bh_idx
-                    if const_expr(mPageTable is not None):
-                        page, offset = resolve_paged_token(
-                            mPageTable[bh_idx // num_heads_kv, None],
-                            v_block * tile_n,
-                            mV.shape[1],
-                        )
-                        page = cute.arch.make_warp_uniform(page)
-                        offset = cute.arch.make_warp_uniform(offset)
-                        v_block = offset // tile_n
-                        v_bh = page * num_heads_kv + bh_idx % num_heads_kv
-                    v_block_coord = (0, v_block, v_bh)
-                    gVt = cute.local_tile(mV, (hdim_v, tile_n), v_block_coord)
-                    gVt_blk = cute.zipped_divide(gVt, kv_tiler)
                     for sk in cutlass.range_constexpr(num_pv_k_tiles):
-                        gVt_sub = gVt_blk[(None, None), (None, sk)]
+                        v_token, v_bh = v_start + sk * tile_k, bh_idx
+                        if const_expr(mPageTable is not None):
+                            half = sk * tile_k // tile_m
+                            page, v_offset = v_pages[half]
+                            page = cute.arch.make_warp_uniform(page)
+                            v_token = (
+                                cute.arch.make_warp_uniform(v_offset) + sk * tile_k - half * tile_m
+                            )
+                            v_bh = page * num_heads_kv + bh_idx % num_heads_kv
+                        gVt = cute.local_tile(mV, (hdim_v, tile_k), (0, v_token // tile_k, v_bh))
+                        gVt_sub = cute.zipped_divide(gVt, kv_tiler)[(None, None), (None, 0)]
                         tVgV = thr_mma_pv.partition_A(gVt_sub)
                         for dm in cutlass.range_constexpr(num_d_tiles):
                             gVt_cur = tVgV[None, None, None, dm]
@@ -1279,6 +1297,7 @@ class FlashAttentionForwardSm100SwapAB:
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
         use_s_ping_pong: bool = False,
+        block_spans_pages: bool = False,
     ):
         if head_dim not in (64, 96, 128) or head_dim_v not in (None, 64, 96, 128):
             raise ValueError("SwapAB supports QK and V head dimensions 64, 96, 128")
@@ -1315,6 +1334,7 @@ class FlashAttentionForwardSm100SwapAB:
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
+        self.block_spans_pages = block_spans_pages
         self.tile_hq = m_block_size
         self.num_hq_blocks = (qhead_per_kvhead + self.tile_hq - 1) // self.tile_hq
 
@@ -1429,6 +1449,7 @@ class FlashAttentionForwardSm100SwapAB:
             mask_mod=self.mask_mod,
             is_local=self.is_local,
             head_dim_v=self.head_dim_v,
+            block_spans_pages=self.block_spans_pages,
         )
         problem_size = (batch, num_heads, num_heads_kv, seqlen_k, self.head_dim)
         # Stock conventions carried through: window sizes as resolved by

@@ -201,7 +201,7 @@ def _run(args, kind, num_splits, *, masked=False):
 _STATIC_CASES = [
     pytest.param(kind, page, splits, id=f"{kind}-page{page}-split{splits}")
     for kind in _MODIFIERS
-    for page in (256, 512)
+    for page in (128, 256, 512)
     for splits in (1, 3)
 ]
 
@@ -283,7 +283,7 @@ def test_paged_score_mod_oversplit_empty_and_masked():
 
 
 @pytest.mark.parametrize(
-    "page_size", [pytest.param(128, id="page128"), pytest.param(384, id="page384")]
+    "page_size", [pytest.param(64, id="page64"), pytest.param(192, id="page192")]
 )
 def test_paged_score_mod_unsupported_page(page_size, monkeypatch):
     args = _inputs(page_size, 4400 + page_size)

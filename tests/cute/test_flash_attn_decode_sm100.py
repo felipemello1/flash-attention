@@ -196,9 +196,9 @@ def test_public_buffers_and_combine(ns, monkeypatch):
     torch.testing.assert_close(public_l, actual_lse)
 
 
-@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("page", [None, 128, 256])
 @pytest.mark.parametrize("ns", [1, 3])
-def test_varlen_single_query(paged, ns):
+def test_varlen_single_query(page, ns):
     """Varlen decode: q (total_q, h, d), at most one token per sequence. Batch 1 has no query
     token (CUDA-graph padding) and must write nothing; batch 3 has no keys."""
     torch.manual_seed(5)
@@ -209,18 +209,19 @@ def test_varlen_single_query(paged, ns):
     rows = [0, 2, 3]
     cu = torch.tensor([0, 1, 1, 2, 3], device="cuda", dtype=torch.int32)
     kw = {}
-    if paged:
-        table = torch.tensor([[2, 5, 9], [0, 4, 7], [8, 1, 3], [6, 10, 11]], device="cuda")
+    if page:
+        pages = 4 * 768 // page
+        table = torch.randperm(pages, device="cuda").view(4, -1)
         kw["page_table"] = table.to(torch.int32)
-        k_cache = torch.empty(12, 256, 2, 128, device="cuda", dtype=q.dtype)
+        k_cache = torch.empty(pages, page, 2, 128, device="cuda", dtype=q.dtype)
         v_cache = torch.empty_like(k_cache)
-        k_cache[table.flatten()] = k.reshape(12, 256, 2, 128)
-        v_cache[table.flatten()] = v.reshape(12, 256, 2, 128)
+        k_cache[table.flatten()] = k.reshape(pages, page, 2, 128)
+        v_cache[table.flatten()] = v.reshape(pages, page, 2, 128)
     out = torch.full((3, 6, 128), float("nan"), device="cuda", dtype=q.dtype)
     o, lse, *_ = _flash_attn_fwd(
         q[rows, 0],
-        k_cache if paged else k,
-        v_cache if paged else v,
+        k_cache if page else k,
+        v_cache if page else v,
         cu_seqlens_q=cu,
         max_seqlen_q=1,
         seqused_k=used,
@@ -324,7 +325,7 @@ def test_paged_stats_handshake(blocks, ns):
     torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("page_size", [256, 512, 768])
+@pytest.mark.parametrize("page_size", [128, 256, 384, 512, 768])
 @pytest.mark.parametrize("dims", [(128, 128), (96, 64)])
 @pytest.mark.parametrize("ns", [1, 3])
 def test_paged_graph(page_size, dims, ns):
@@ -362,7 +363,7 @@ def test_paged_graph(page_size, dims, ns):
 
 
 @pytest.mark.parametrize(
-    "kind", ["prefill", "training", "hd256", "page128", "page384", "override"]
+    "kind", ["prefill", "training", "hd256", "page64", "page192", "override"]
 )
 def test_fallback(kind, monkeypatch):
     q, k, v = inputs()

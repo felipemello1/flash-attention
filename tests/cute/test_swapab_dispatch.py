@@ -232,10 +232,11 @@ class DispatchTests(unittest.TestCase):
     def test_paging_uses_logical_capacity_not_physical_pool(self):
         dispatch = load_dispatch()
         for page_size, supported in (
-            (128, False),
+            (64, False),
+            (128, True),
             (255, False),
             (256, True),
-            (384, False),
+            (384, True),
             (512, True),
             (768, True),
         ):

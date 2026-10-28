@@ -1438,6 +1438,8 @@ def _flash_attn_fwd(
         else page_size % 64 == 0 if mla_1cta_kb64
         else page_size == tile_n
     )
+    # SwapAB's 256-key block spans two pages unless the page size is a multiple of 256.
+    swapab_block_spans_pages = swapab.use_swapab and page_table is not None and page_size % 256 != 0
 
     s_ping_pong_seqlen_k_loaded = (
         max_seqlen_k
@@ -1516,6 +1518,7 @@ def _flash_attn_fwd(
         pack_gqa,
         arch,
         paged_kv_tma,
+        swapab_block_spans_pages,
         use_2cta_instrs,
         q_subtile_factor,
         kv_subtile_factor,
@@ -1747,10 +1750,11 @@ def _flash_attn_fwd(
                         rescale_threshold=mla_fwd_rescale_threshold,
                     )
             else:
-                fwd_cls = FlashAttentionForwardSm100
+                fwd_cls, fwd_kwargs = FlashAttentionForwardSm100, {}
                 if swapab.use_swapab:
                     from flash_attn.cute.flash_fwd_decode_sm100 import FlashAttentionForwardSm100SwapAB
                     fwd_cls = FlashAttentionForwardSm100SwapAB
+                    fwd_kwargs["block_spans_pages"] = swapab_block_spans_pages
                 fa_fwd = fwd_cls(
                     head_dim,
                     head_dim_v,
@@ -1775,6 +1779,7 @@ def _flash_attn_fwd(
                     seqlen_k_per_split=seqlen_k_per_split,
                     has_tile_count_semaphore=tile_count_semaphore is not None,
                     use_s_ping_pong=use_s_ping_pong,
+                    **fwd_kwargs,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
