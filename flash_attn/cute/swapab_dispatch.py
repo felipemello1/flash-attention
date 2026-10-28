@@ -1,4 +1,5 @@
-"""Private, CPU-only per-call capability policy for the SM100 SwapAB backend."""
+"""Private, CPU-only per-call capability policy for the SM100 SwapAB backend, plus one speed rule
+for short sliding windows."""
 
 from dataclasses import dataclass
 import math
@@ -52,6 +53,17 @@ FORWARD_OPTION_POLICY = MappingProxyType(
         "gather_bwd_recompute_p": "default only",
     }
 )
+
+# Speed rule for sliding windows (auto mode only), measured on GB300 decode at windows 128 and 2048
+# with 128-token pages. A window caps the keys per sequence; with few keys the standard kernel is
+# faster.
+SWAPAB_MIN_WINDOW = 1024  # window 128: SwapAB takes 1.0-2.2x the standard kernel's time
+# TODO: windows between 128 and 2048 keys are not measured; 1024 is a midpoint.
+# hd64, window 2048: SwapAB takes 1.02-1.18x the standard kernel's time once batch x kv heads
+# >= 1024 (0.54-1.01x below). TODO: the crossover between 2k keys (loses) and 8k (wins) is not
+# measured.
+SWAPAB_HD64_SHORT_WINDOW = 2048
+SWAPAB_HD64_STANDARD_MIN_SEQ_KV_HEADS = 1024  # smallest batch x kv heads on the standard kernel
 
 
 @dataclass(frozen=True)
@@ -142,13 +154,22 @@ def select_swapab_backend(
         return reject("GQA ratio")
     if any(t.stride(-1) != 1 for t in (q, k, v)):
         return reject("contiguous head dimension")
+    batch_size = request["cu_seqlens_q"].shape[0] - 1 if varlen_q else q.shape[0]
     if page_table is not None:
         if k.shape[1] < 128 or k.shape[1] % 128:
             return reject("page size must be divisible by 128")
         capacity = page_table.shape[1] * k.shape[1]
     else:
-        batch_size = request["cu_seqlens_q"].shape[0] - 1 if varlen_q else q.shape[0]
         if batch_size != k.shape[0]:
             return reject("batch size")
         capacity = k.shape[1]
+    window = request.get("window_size_left")
+    if mode == "auto" and window is not None and window >= 0:
+        short = window < SWAPAB_MIN_WINDOW or (
+            q.shape[-1] == 64
+            and window <= SWAPAB_HD64_SHORT_WINDOW
+            and batch_size * k.shape[2] >= SWAPAB_HD64_STANDARD_MIN_SEQ_KV_HEADS
+        )
+        if short:
+            return SwapABDecision(False, "short sliding window: the standard kernel is faster")
     return SwapABDecision(True, "eligible SM100/SM103 single-query inference", capacity)
