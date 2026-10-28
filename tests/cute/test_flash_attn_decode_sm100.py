@@ -196,6 +196,31 @@ def test_public_buffers_and_combine(ns, monkeypatch):
     torch.testing.assert_close(public_l, actual_lse)
 
 
+@pytest.mark.parametrize("window", [None, 127])
+@pytest.mark.parametrize("ns", [1, 3])
+def test_learnable_sink(window, ns):
+    """A sink is one more softmax column per q head with no value. Batch 0 has no keys, so its
+    output is 0 and its LSE is the sink."""
+    q, k, v = inputs(length=777)
+    used = torch.tensor([0, 700], device="cuda", dtype=torch.int32)
+    sink = torch.randn(q.shape[2], device="cuda") * 2
+    o, lse, *_ = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        seqused_k=used,
+        window_size_left=window,
+        learnable_sink=sink,
+        num_splits=ns,
+        return_lse=True,
+    )
+    ro, rl = reference(q, k, v, used, window)
+    rl_sink = torch.logaddexp(rl, sink[None, :, None])
+    ro_sink = ro * torch.exp(rl - rl_sink).transpose(1, 2)[..., None]
+    torch.testing.assert_close(o.float(), ro_sink, atol=0.004, rtol=0.025)
+    torch.testing.assert_close(lse, rl_sink, atol=0.004, rtol=0.003)
+
+
 @pytest.mark.parametrize("page", [None, 128, 256])
 @pytest.mark.parametrize("ns", [1, 3])
 def test_varlen_single_query(page, ns):
@@ -233,6 +258,40 @@ def test_varlen_single_query(page, ns):
     ro, rl = reference(q, k, v, used)
     torch.testing.assert_close(o.float(), ro[rows, 0], atol=0.004, rtol=0.025)
     torch.testing.assert_close(lse, rl[rows, :, 0].t(), atol=0.004, rtol=0.003)
+
+
+@pytest.mark.parametrize("ns", [1, 3])
+def test_varlen_paged_learnable_sink(ns):
+    """The generator's call: varlen Q, 128-token pages and a sink. Batch 2 has no keys, so its
+    output is 0 and its LSE is the sink."""
+    torch.manual_seed(8)
+    q = torch.randn(3, 1, 16, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(3, 512, 2, 64, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    used = torch.tensor([129, 512, 0], device="cuda", dtype=torch.int32)
+    table = torch.randperm(12, device="cuda").view(3, 4)
+    k_cache = torch.empty(12, 128, 2, 64, device="cuda", dtype=q.dtype)
+    v_cache = torch.empty_like(k_cache)
+    k_cache[table.flatten()] = k.reshape(12, 128, 2, 64)
+    v_cache[table.flatten()] = v.reshape(12, 128, 2, 64)
+    sink = torch.randn(16, device="cuda") * 2
+    o, lse, *_ = _flash_attn_fwd(
+        q[:, 0],
+        k_cache,
+        v_cache,
+        cu_seqlens_q=torch.arange(4, device="cuda", dtype=torch.int32),
+        max_seqlen_q=1,
+        seqused_k=used,
+        page_table=table.to(torch.int32),
+        learnable_sink=sink,
+        num_splits=ns,
+        return_lse=True,
+    )
+    ro, rl = reference(q, k, v, used)
+    rl_sink = torch.logaddexp(rl, sink[None, :, None])
+    ro_sink = ro * torch.exp(rl - rl_sink).transpose(1, 2)[..., None]
+    torch.testing.assert_close(o.float(), ro_sink[:, 0], atol=0.004, rtol=0.025)
+    torch.testing.assert_close(lse, rl_sink[:, :, 0].t(), atol=0.004, rtol=0.003)
 
 
 @pytest.mark.parametrize("ns", [1, 3])

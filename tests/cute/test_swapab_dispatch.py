@@ -113,7 +113,6 @@ class DispatchTests(unittest.TestCase):
             "cu_seqlens_q": object(),
             "cu_seqlens_k": object(),
             "seqused_q": object(),
-            "learnable_sink": object(),
             "tile_mn": (32, 256),
             "mma_pv_is_rs": False,
             "intra_wg_overlap": False,
@@ -161,6 +160,9 @@ class DispatchTests(unittest.TestCase):
             with self.subTest(arch=arch):
                 self.assertFalse(decide(dispatch, arch=arch).use_swapab)
         self.assertTrue(decide(dispatch, arch=103).use_swapab)
+        self.assertTrue(
+            decide(dispatch, request_defaults(learnable_sink=TensorMetadata((6,)))).use_swapab
+        )
         self.assertFalse(decide(dispatch, requires_grad=True).use_swapab)
         for name, shape in (
             ("q", (2, 2, 6, 96)),

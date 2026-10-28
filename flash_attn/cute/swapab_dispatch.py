@@ -26,7 +26,7 @@ FORWARD_OPTION_POLICY = MappingProxyType(
         "softcap": "supported",
         "window_size_left": "supported",
         "window_size_right": "supported",
-        "learnable_sink": "unsupported",
+        "learnable_sink": "supported",
         "tile_mn": "unsupported",
         "mma_pv_is_rs": "unsupported",
         "intra_wg_overlap": "unsupported",

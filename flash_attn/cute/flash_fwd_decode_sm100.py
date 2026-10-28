@@ -40,7 +40,7 @@ from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
 from flash_attn.cute.pipeline import NamedBarrier
 from flash_attn.cute.paged_kv import resolve_paged_token, copy_kv_tma
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.softmax import call_score_mod
+from flash_attn.cute.softmax import apply_learnable_sink, call_score_mod
 from flash_attn.cute.mask import call_mask_mod
 from flash_attn.cute.utils import AuxData, LOG2_E, scalar_to_ssa, ssa_to_scalar
 
@@ -121,6 +121,7 @@ class _SwapABCore:
         aux_data: AuxData = AuxData(),
         mPageTable: cute.Tensor | None = None,
         mCuSeqlensQ: cute.Tensor | None = None,  # (batch + 1,): Q row of batch b; else row b
+        mSink: cute.Tensor | None = None,  # (num_heads,): learnable sink logit per q head
     ):
         block = (NUM_WG * WG_SIZE, 1, 1)
         num_splits = self.grid_shape[0]
@@ -294,6 +295,7 @@ class _SwapABCore:
             aux_data,
             mPageTable,
             mCuSeqlensQ,
+            mSink,
         ).launch(
             grid=self.grid_shape,
             block=block,
@@ -326,6 +328,7 @@ class _SwapABCore:
         aux_data: AuxData,
         mPageTable: cute.Tensor | None,
         mCuSeqlensQ: cute.Tensor | None,
+        mSink: cute.Tensor | None,
     ):
         # Warp roles (see header): WG0 = MMA + TMA warps, WG1 / WG2 = softmax for even / odd KV blocks,
         # WG3 = correction. Warp 2 publishes this split's LSE and reciprocal row sum.
@@ -1211,6 +1214,9 @@ class _SwapABCore:
                 sRowMax,
                 sRowSumWarp,
                 mLSE_partial,
+                mSink,
+                num_heads_kv,
+                qhead_per_kvhead,
             )
 
     @staticmethod
@@ -1227,6 +1233,9 @@ class _SwapABCore:
         sRowMax: cute.Tensor,
         sRowSumWarp: cute.Tensor,
         mLSE_partial: cute.Tensor | None,
+        mSink: cute.Tensor | None,
+        num_heads_kv: Int32,
+        qhead_per_kvhead: Int32,
     ):
         split_id, hq_block, q_bh = block_idx
         lane_owns_head = lane_idx < tile_hq
@@ -1243,6 +1252,13 @@ class _SwapABCore:
             row_sum_w01 = sRowSumWarp[0, lane_idx] + sRowSumWarp[1, lane_idx]
             row_sum_w23 = sRowSumWarp[2, lane_idx] + sRowSumWarp[3, lane_idx]
             row_sum = row_sum_w01 + row_sum_w23
+            if cutlass.const_expr(mSink is not None):
+                # Split 0 owns the sink column; row_max is already in scaled log2 units.
+                if split_id == 0 and head < qhead_per_kvhead:
+                    sink = Float32(mSink[(q_bh % num_heads_kv) * qhead_per_kvhead + head])
+                    row_max_lane, row_sum = apply_learnable_sink(
+                        row_max_lane, row_sum, sink, Float32(1.0)
+                    )
             inv_sum = Float32(0.0)
             if row_sum > Float32(0.0):
                 inv_sum = cute.arch.rcp_approx(row_sum)
@@ -1254,7 +1270,6 @@ class _SwapABCore:
                         lse = (row_max_lane + cute.math.log2(row_sum, fastmath=True)) * math.log(
                             2.0
                         )
-                    num_heads_kv = mLSE_partial.shape[2][0]
                     bh_coord = (q_bh % num_heads_kv, q_bh // num_heads_kv)
                     mLSE_partial[split_id, head, bh_coord] = lse
 
@@ -1375,7 +1390,6 @@ class FlashAttentionForwardSm100SwapAB:
         for value in (
             mCuSeqlensK,
             mSeqUsedQ,
-            learnable_sink,
             descale_tensors,
             blocksparse_tensors,
             num_splits_dynamic_ptr,
@@ -1470,4 +1484,5 @@ class FlashAttentionForwardSm100SwapAB:
             aux_data,
             mPageTable,
             mCuSeqlensQ,
+            learnable_sink,
         )
