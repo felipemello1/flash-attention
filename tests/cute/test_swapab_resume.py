@@ -88,8 +88,9 @@ def test_cpu_probe_requires_explicit_cache_directory():
 def sm100(monkeypatch):
     import torch
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("real SM100 required; not a fake-tensor compilation test")
+    capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("real SM100 / SM103 required; not a fake-tensor compilation test")
 
     monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", "swapab")
     monkeypatch.setenv("FLASH_ATTENTION_FAKE_TENSOR", "0")

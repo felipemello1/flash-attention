@@ -113,7 +113,6 @@ class DispatchTests(unittest.TestCase):
             "cu_seqlens_q": object(),
             "cu_seqlens_k": object(),
             "seqused_q": object(),
-            "learnable_sink": object(),
             "tile_mn": (32, 256),
             "mma_pv_is_rs": False,
             "intra_wg_overlap": False,
@@ -140,11 +139,30 @@ class DispatchTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, name):
                     decide(dispatch, request, mode="swapab")
 
+    def test_varlen_single_query(self):
+        dispatch = load_dispatch()
+        varlen = dict(q=TensorMetadata((2, 6, 96)), cu_seqlens_q=TensorMetadata((3,)))
+        self.assertTrue(decide(dispatch, request_defaults(**varlen, max_seqlen_q=1)).use_swapab)
+        for max_seqlen_q in (None, 2):
+            with self.subTest(max_seqlen_q=max_seqlen_q):
+                decision = decide(dispatch, request_defaults(**varlen, max_seqlen_q=max_seqlen_q))
+                self.assertFalse(decision.use_swapab)
+                self.assertIn("max_seqlen_q", decision.reason)
+        # Dense K needs one cache row per sequence.
+        request = request_defaults(
+            q=TensorMetadata((3, 6, 96)), cu_seqlens_q=TensorMetadata((4,)), max_seqlen_q=1
+        )
+        self.assertFalse(decide(dispatch, request).use_swapab)
+
     def test_architecture_training_dtype_and_shape_guards(self):
         dispatch = load_dispatch()
         for arch in (80, 90, 101, 110, 120):
             with self.subTest(arch=arch):
                 self.assertFalse(decide(dispatch, arch=arch).use_swapab)
+        self.assertTrue(decide(dispatch, arch=103).use_swapab)
+        self.assertTrue(
+            decide(dispatch, request_defaults(learnable_sink=TensorMetadata((6,)))).use_swapab
+        )
         self.assertFalse(decide(dispatch, requires_grad=True).use_swapab)
         for name, shape in (
             ("q", (2, 2, 6, 96)),
@@ -189,7 +207,7 @@ class DispatchTests(unittest.TestCase):
                                 v=TensorMetadata((2, 1025, 2, dv), dtype),
                                 seqused_k=object(),
                                 causal=True,
-                                window_size_left=31,
+                                window_size_left=2047,
                                 window_size_right=0,
                                 softcap=2.0,
                                 mask_mod=object(),
@@ -216,10 +234,11 @@ class DispatchTests(unittest.TestCase):
     def test_paging_uses_logical_capacity_not_physical_pool(self):
         dispatch = load_dispatch()
         for page_size, supported in (
-            (128, False),
+            (64, False),
+            (128, True),
             (255, False),
             (256, True),
-            (384, False),
+            (384, True),
             (512, True),
             (768, True),
         ):
@@ -236,6 +255,30 @@ class DispatchTests(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(ValueError, "page"):
                         decide(dispatch, req, mode="swapab")
+
+    def test_short_sliding_window_uses_standard_in_auto_mode(self):
+        dispatch = load_dispatch()
+        for left, batch, dim, auto in (
+            (None, 2, 96, True),
+            (-1, 2, 96, True),
+            (127, 2, 96, False),
+            (1023, 2, 96, False),
+            (1024, 2, 96, True),
+            (2047, 511, 64, True),
+            (2047, 512, 64, False),  # 512 sequences x 2 kv heads
+            (8191, 512, 64, True),
+            (2047, 512, 128, True),
+        ):
+            with self.subTest(left=left, batch=batch, dim=dim):
+                req = request_defaults(
+                    q=TensorMetadata((batch, 1, 6, dim)),
+                    k=TensorMetadata((batch, 1025, 2, dim)),
+                    v=TensorMetadata((batch, 1025, 2, dim)),
+                    window_size_left=left,
+                    window_size_right=0,
+                )
+                self.assertEqual(decide(dispatch, req).use_swapab, auto)
+                self.assertTrue(decide(dispatch, req, mode="swapab").use_swapab)
 
     def test_nonpositive_or_nonfinite_scale_uses_original_backend(self):
         dispatch = load_dispatch()

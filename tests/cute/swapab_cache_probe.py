@@ -59,8 +59,9 @@ def main(argv=None):
     from flash_attn.cute.cache_utils import JITPersistentCache
     from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_fwd_combine
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        raise RuntimeError("cache probe requires a real SM100 GPU")
+    capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+    if capability not in ((10, 0), (10, 3)):
+        raise RuntimeError("cache probe requires a real SM100 / SM103 GPU")
     caches = {
         "fwd": _flash_attn_fwd.compile_cache,
         "combine": _flash_attn_fwd_combine.compile_cache,

@@ -10,8 +10,8 @@ from flash_attn.cute.interface import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
-    reason="SM100 SwapAB integration",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="SM100 / SM103 SwapAB integration",
 )
 
 
@@ -196,6 +196,159 @@ def test_public_buffers_and_combine(ns, monkeypatch):
     torch.testing.assert_close(public_l, actual_lse)
 
 
+@pytest.mark.parametrize("window", [None, 127])
+@pytest.mark.parametrize("ns", [1, 3])
+def test_learnable_sink(window, ns):
+    """A sink is one more softmax column per q head with no value. Batch 0 has no keys, so its
+    output is 0 and its LSE is the sink."""
+    q, k, v = inputs(length=777)
+    used = torch.tensor([0, 700], device="cuda", dtype=torch.int32)
+    sink = torch.randn(q.shape[2], device="cuda") * 2
+    o, lse, *_ = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        seqused_k=used,
+        window_size_left=window,
+        learnable_sink=sink,
+        num_splits=ns,
+        return_lse=True,
+    )
+    ro, rl = reference(q, k, v, used, window)
+    rl_sink = torch.logaddexp(rl, sink[None, :, None])
+    ro_sink = ro * torch.exp(rl - rl_sink).transpose(1, 2)[..., None]
+    torch.testing.assert_close(o.float(), ro_sink, atol=0.004, rtol=0.025)
+    torch.testing.assert_close(lse, rl_sink, atol=0.004, rtol=0.003)
+
+
+@pytest.mark.parametrize("page", [None, 128, 256])
+@pytest.mark.parametrize("ns", [1, 3])
+def test_varlen_single_query(page, ns):
+    """Varlen decode: q (total_q, h, d), at most one token per sequence. Batch 1 has no query
+    token (CUDA-graph padding) and must write nothing; batch 3 has no keys."""
+    torch.manual_seed(5)
+    q = torch.randn(4, 1, 6, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(4, 768, 2, 128, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    used = torch.tensor([300, 700, 768, 0], device="cuda", dtype=torch.int32)
+    rows = [0, 2, 3]
+    cu = torch.tensor([0, 1, 1, 2, 3], device="cuda", dtype=torch.int32)
+    kw = {}
+    if page:
+        pages = 4 * 768 // page
+        table = torch.randperm(pages, device="cuda").view(4, -1)
+        kw["page_table"] = table.to(torch.int32)
+        k_cache = torch.empty(pages, page, 2, 128, device="cuda", dtype=q.dtype)
+        v_cache = torch.empty_like(k_cache)
+        k_cache[table.flatten()] = k.reshape(pages, page, 2, 128)
+        v_cache[table.flatten()] = v.reshape(pages, page, 2, 128)
+    out = torch.full((3, 6, 128), float("nan"), device="cuda", dtype=q.dtype)
+    o, lse, *_ = _flash_attn_fwd(
+        q[rows, 0],
+        k_cache if page else k,
+        v_cache if page else v,
+        cu_seqlens_q=cu,
+        max_seqlen_q=1,
+        seqused_k=used,
+        num_splits=ns,
+        return_lse=True,
+        out=out,
+        **kw,
+    )
+    ro, rl = reference(q, k, v, used)
+    torch.testing.assert_close(o.float(), ro[rows, 0], atol=0.004, rtol=0.025)
+    torch.testing.assert_close(lse, rl[rows, :, 0].t(), atol=0.004, rtol=0.003)
+
+
+@pytest.mark.parametrize("ns", [1, 3])
+def test_varlen_paged_learnable_sink(ns):
+    """The generator's call: varlen Q, 128-token pages and a sink. Batch 2 has no keys, so its
+    output is 0 and its LSE is the sink."""
+    torch.manual_seed(8)
+    q = torch.randn(3, 1, 16, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(3, 512, 2, 64, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    used = torch.tensor([129, 512, 0], device="cuda", dtype=torch.int32)
+    table = torch.randperm(12, device="cuda").view(3, 4)
+    k_cache = torch.empty(12, 128, 2, 64, device="cuda", dtype=q.dtype)
+    v_cache = torch.empty_like(k_cache)
+    k_cache[table.flatten()] = k.reshape(12, 128, 2, 64)
+    v_cache[table.flatten()] = v.reshape(12, 128, 2, 64)
+    sink = torch.randn(16, device="cuda") * 2
+    o, lse, *_ = _flash_attn_fwd(
+        q[:, 0],
+        k_cache,
+        v_cache,
+        cu_seqlens_q=torch.arange(4, device="cuda", dtype=torch.int32),
+        max_seqlen_q=1,
+        seqused_k=used,
+        page_table=table.to(torch.int32),
+        learnable_sink=sink,
+        num_splits=ns,
+        return_lse=True,
+    )
+    ro, rl = reference(q, k, v, used)
+    rl_sink = torch.logaddexp(rl, sink[None, :, None])
+    ro_sink = ro * torch.exp(rl - rl_sink).transpose(1, 2)[..., None]
+    torch.testing.assert_close(o.float(), ro_sink[:, 0], atol=0.004, rtol=0.025)
+    torch.testing.assert_close(lse, rl_sink[:, :, 0].t(), atol=0.004, rtol=0.003)
+
+
+@pytest.mark.parametrize("ns", [1, 3])
+def test_varlen_trailing_padding(ns):
+    """vLLM pads a CUDA-graph batch at the end: cu_seqlens_q = [0, 1, 2, 3, 3] over 4 Q rows.
+    The padded sequence must leave its O row and LSE column untouched. Only ns=1 catches a
+    missing has_query gate: with splits, the combine writes only rows inside cu_seqlens_q."""
+    torch.manual_seed(7)
+    q = torch.randn(4, 1, 6, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(4, 768, 2, 128, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    used = torch.tensor([300, 700, 768, 500], device="cuda", dtype=torch.int32)
+    cu = torch.tensor([0, 1, 2, 3, 3], device="cuda", dtype=torch.int32)
+    out = torch.full((4, 6, 128), float("nan"), device="cuda", dtype=q.dtype)
+    lse = torch.full((6, 4), float("nan"), device="cuda", dtype=torch.float32)
+    _flash_attn_fwd(
+        q[:, 0],
+        k,
+        v,
+        cu_seqlens_q=cu,
+        max_seqlen_q=1,
+        seqused_k=used,
+        num_splits=ns,
+        return_lse=True,
+        out=out,
+        lse=lse,
+    )
+    ro, rl = reference(q[:3], k[:3], v[:3], used[:3])
+    torch.testing.assert_close(out[:3].float(), ro[:, 0], atol=0.004, rtol=0.025)
+    torch.testing.assert_close(lse[:, :3], rl[:, :, 0].t(), atol=0.004, rtol=0.003)
+    assert out[3].isnan().all() and lse[:, 3].isnan().all()
+
+
+@pytest.mark.parametrize("ns", [1, 3])
+def test_varlen_single_query_large_batch(ns):
+    """Above 256 sequences the general varlen scheduler builds tile metadata; SwapAB needs none."""
+    torch.manual_seed(6)
+    q = torch.randn(300, 1, 6, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(300, 300, 2, 64, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    used = torch.randint(1, 301, (300,), device="cuda", dtype=torch.int32)
+    cu = torch.arange(301, device="cuda", dtype=torch.int32)
+    o, lse, *_ = _flash_attn_fwd(
+        q[:, 0],
+        k,
+        v,
+        cu_seqlens_q=cu,
+        max_seqlen_q=1,
+        seqused_k=used,
+        num_splits=ns,
+        return_lse=True,
+    )
+    ro, rl = reference(q, k, v, used)
+    torch.testing.assert_close(o.float(), ro[:, 0], atol=0.004, rtol=0.025)
+    torch.testing.assert_close(lse, rl[:, :, 0].t(), atol=0.004, rtol=0.003)
+
+
 @pytest.mark.parametrize("blocks", [3, 8])
 @pytest.mark.parametrize("ns", [1, 2])
 def test_paged_stats_handshake(blocks, ns):
@@ -231,7 +384,7 @@ def test_paged_stats_handshake(blocks, ns):
     torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("page_size", [256, 512, 768])
+@pytest.mark.parametrize("page_size", [128, 256, 384, 512, 768])
 @pytest.mark.parametrize("dims", [(128, 128), (96, 64)])
 @pytest.mark.parametrize("ns", [1, 3])
 def test_paged_graph(page_size, dims, ns):
@@ -269,7 +422,7 @@ def test_paged_graph(page_size, dims, ns):
 
 
 @pytest.mark.parametrize(
-    "kind", ["prefill", "training", "hd256", "page128", "page384", "override"]
+    "kind", ["prefill", "training", "hd256", "page64", "page192", "override"]
 )
 def test_fallback(kind, monkeypatch):
     q, k, v = inputs()
