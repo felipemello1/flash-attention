@@ -995,8 +995,23 @@ def _flash_attn_fwd(
         pack_gqa = True
     is_hdim256 = head_dim == 256 and head_dim_v == 256
     num_sms = get_num_sms_for_selection(device.index, arch)
+    # The varlen grid has a tile per request, so request slots without tokens (CUDA-graph
+    # padding: batch_size and max_seqlen_q frozen at capture) still launch CTAs. When those can
+    # outnumber the real tiles, build scheduler metadata: the persistent scheduler visits only
+    # the real tiles.
+    padded_varlen = (
+        arch // 10 in [10, 11]
+        and cu_seqlens_q is not None
+        and causal
+        and scheduler_metadata is None
+        and not disable_scheduler_metadata
+        and qv is None
+        and batch_size * 128 > total_q * qhead_per_kvhead
+    )
     # Caller-built varlen scheduler metadata assumes 1CTA tiles and the default pack_gqa.
-    hd256_2cta_varlen_ok = cu_seqlens_q is None or scheduler_metadata is None
+    hd256_2cta_varlen_ok = cu_seqlens_q is None or (
+        scheduler_metadata is None and not padded_varlen
+    )
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
         if (
@@ -1263,7 +1278,7 @@ def _flash_attn_fwd(
         # the MLA kernels write all num_splits partials (no per-batch dynamic split counts)
         assert scheduler_metadata is None, "scheduler_metadata is not supported with qv"
     if (
-        is_split_kv
+        (is_split_kv or padded_varlen)
         and is_varlen_q
         and scheduler_metadata is None
         and not disable_scheduler_metadata
