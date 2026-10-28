@@ -995,8 +995,27 @@ def _flash_attn_fwd(
         pack_gqa = True
     is_hdim256 = head_dim == 256 and head_dim_v == 256
     num_sms = get_num_sms_for_selection(device.index, arch)
-    # Caller-built varlen scheduler metadata assumes 1CTA tiles and the default pack_gqa.
-    hd256_2cta_varlen_ok = cu_seqlens_q is None or scheduler_metadata is None
+    # The single-tile varlen grid launches a partial tile per request, empty or not (CUDA-graph
+    # slots with no tokens). When the request slots could outnumber the real tiles (128 = the
+    # smallest M tile; the config is picked below), build scheduler metadata so the persistent
+    # scheduler visits only real tiles. Calls of one M block per request (decode) already run
+    # the static persistent grid, and CLC keeps its own scheduler.
+    persistent_varlen = (
+        arch // 10 in [10, 11]
+        and cu_seqlens_q is not None
+        and causal
+        and scheduler_metadata is None
+        and not disable_scheduler_metadata
+        and not requested_use_clc_scheduler
+        and qv is None
+        and max_seqlen_q * qhead_per_kvhead > 128
+        and batch_size * 128 > total_q * qhead_per_kvhead
+    )
+    # Varlen scheduler metadata (caller-built or persistent_varlen) needs 1CTA tiles
+    # (DynamicPersistentVarlenScheduler takes cluster (1, 1)) and the default pack_gqa.
+    hd256_2cta_varlen_ok = cu_seqlens_q is None or (
+        scheduler_metadata is None and not persistent_varlen
+    )
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
         if (
@@ -1263,7 +1282,7 @@ def _flash_attn_fwd(
         # the MLA kernels write all num_splits partials (no per-batch dynamic split counts)
         assert scheduler_metadata is None, "scheduler_metadata is not supported with qv"
     if (
-        is_split_kv
+        (is_split_kv or (persistent_varlen and not max_m_blocks_leq_one))
         and is_varlen_q
         and scheduler_metadata is None
         and not disable_scheduler_metadata
@@ -1286,7 +1305,7 @@ def _flash_attn_fwd(
             cu_seqlens_k=cu_seqlens_k,
             seqused_q=seqused_q,
             seqused_k=seqused_k,
-            seqlen_k_per_split=seqlen_k_per_split,
+            seqlen_k_per_split=seqlen_k_per_split if is_split_kv else None,
             q_stage=q_stage,
             cluster_shape_m=cluster_shape_m,
             total_q=total_q if cu_seqlens_q is not None else None,
