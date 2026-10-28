@@ -389,9 +389,9 @@ def test_padded_varlen_slots_use_persistent_scheduler(
     check_against_reference((out_padded,), q, k, v, None, q_lens, k_lens, True, dtype)
 
 
-def test_persistent_varlen_cuda_graph_replay():
+def test_persistent_varlen_cuda_graph_replay(monkeypatch):
     """One graph over 64 request slots (the persistent scheduler), replayed with new lengths."""
-    slots, capacity, dtype = 64, 640, torch.bfloat16
+    capacity, dtype = 640, torch.bfloat16
     replays = [
         (10,) * 64,  # every slot active
         (300, 1, 1, 1) + (0,) * 60,  # a prompt and 3 decodes
@@ -411,17 +411,20 @@ def test_persistent_varlen_cuda_graph_replay():
         )
         return out
 
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", JITCache())
+    constructor = Mock(wraps=interface.FlashAttentionForwardSm100)
+    monkeypatch.setattr(interface, "FlashAttentionForwardSm100", constructor)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         step()  # compile outside capture
+    assert constructor.call_args.kwargs["has_tile_count_semaphore"]
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=side):
         static_out = step()
     for lengths in replays:
-        assert len(lengths) == slots
         cu.copy_(make_cu_seqlens(lengths))
         graph.replay()
         torch.cuda.synchronize()
@@ -432,7 +435,7 @@ def test_persistent_varlen_cuda_graph_replay():
             )
 
 
-def test_persistent_varlen_one_split_ignores_seqlen_k_per_split():
+def test_persistent_varlen_one_split_ignores_seqlen_k_per_split(monkeypatch):
     """seqlen_k_per_split only sizes split-KV; a 1-split call that takes the persistent
     scheduler must not check it against num_splits."""
     q_lens, k_lens = (300,) + (1,) * 15, (4096,) * 16
@@ -441,10 +444,14 @@ def test_persistent_varlen_one_split_ignores_seqlen_k_per_split():
     q = torch.randn(sum(q_lens), 8, 128, device="cuda", dtype=dtype)
     k = torch.randn(sum(k_lens), 2, 128, device="cuda", dtype=dtype)
     v = torch.randn_like(k)
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", JITCache())
+    constructor = Mock(wraps=interface.FlashAttentionForwardSm100)
+    monkeypatch.setattr(interface, "FlashAttentionForwardSm100", constructor)
     out, _ = flash_attn_varlen_func(
         q, k, v, cu_seqlens_q=make_cu_seqlens(q_lens), cu_seqlens_k=make_cu_seqlens(k_lens),
         max_seqlen_q=300, max_seqlen_k=4096, causal=True, num_splits=1, seqlen_k_per_split=1024,
     )
+    assert constructor.call_args.kwargs["has_tile_count_semaphore"]
     check_against_reference((out,), q, k, v, None, q_lens, k_lens, True, dtype)
 
 

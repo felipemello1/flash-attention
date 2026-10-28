@@ -1011,8 +1011,8 @@ def _flash_attn_fwd(
         and max_seqlen_q * qhead_per_kvhead > 128
         and batch_size * 128 > total_q * qhead_per_kvhead
     )
-    # Varlen scheduler metadata (caller-built or persistent_varlen) needs 1CTA tiles, since
-    # DynamicPersistentVarlenScheduler takes cluster (1, 1), and the default pack_gqa.
+    # Varlen scheduler metadata (caller-built or persistent_varlen) needs 1CTA tiles
+    # (DynamicPersistentVarlenScheduler takes cluster (1, 1)) and the default pack_gqa.
     hd256_2cta_varlen_ok = cu_seqlens_q is None or (
         scheduler_metadata is None and not persistent_varlen
     )
