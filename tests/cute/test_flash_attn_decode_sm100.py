@@ -10,8 +10,8 @@ from flash_attn.cute.interface import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
-    reason="SM100 SwapAB integration",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="SM100 / SM103 SwapAB integration",
 )
 
 
@@ -194,6 +194,99 @@ def test_public_buffers_and_combine(ns, monkeypatch):
     public_o, public_l = flash_attn_func(q, k, v, num_splits=ns, return_lse=True)
     torch.testing.assert_close(public_o, o)
     torch.testing.assert_close(public_l, actual_lse)
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("ns", [1, 3])
+def test_varlen_single_query(paged, ns):
+    """Varlen decode: q (total_q, h, d), at most one token per sequence. Batch 1 has no query
+    token (CUDA-graph padding) and must write nothing; batch 3 has no keys."""
+    torch.manual_seed(5)
+    q = torch.randn(4, 1, 6, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(4, 768, 2, 128, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    used = torch.tensor([300, 700, 768, 0], device="cuda", dtype=torch.int32)
+    rows = [0, 2, 3]
+    cu = torch.tensor([0, 1, 1, 2, 3], device="cuda", dtype=torch.int32)
+    kw = {}
+    if paged:
+        table = torch.tensor([[2, 5, 9], [0, 4, 7], [8, 1, 3], [6, 10, 11]], device="cuda")
+        kw["page_table"] = table.to(torch.int32)
+        k_cache = torch.empty(12, 256, 2, 128, device="cuda", dtype=q.dtype)
+        v_cache = torch.empty_like(k_cache)
+        k_cache[table.flatten()] = k.reshape(12, 256, 2, 128)
+        v_cache[table.flatten()] = v.reshape(12, 256, 2, 128)
+    out = torch.full((3, 6, 128), float("nan"), device="cuda", dtype=q.dtype)
+    o, lse, *_ = _flash_attn_fwd(
+        q[rows, 0],
+        k_cache if paged else k,
+        v_cache if paged else v,
+        cu_seqlens_q=cu,
+        max_seqlen_q=1,
+        seqused_k=used,
+        num_splits=ns,
+        return_lse=True,
+        out=out,
+        **kw,
+    )
+    ro, rl = reference(q, k, v, used)
+    torch.testing.assert_close(o.float(), ro[rows, 0], atol=0.004, rtol=0.025)
+    torch.testing.assert_close(lse, rl[rows, :, 0].t(), atol=0.004, rtol=0.003)
+
+
+@pytest.mark.parametrize("ns", [1, 3])
+def test_varlen_trailing_padding(ns):
+    """vLLM pads a CUDA-graph batch at the end: cu_seqlens_q = [0, 1, 2, 3, 3] over 4 Q rows.
+    The padded sequence must leave its O row and LSE column untouched. Only ns=1 catches a
+    missing has_query gate: with splits, the combine writes only rows inside cu_seqlens_q."""
+    torch.manual_seed(7)
+    q = torch.randn(4, 1, 6, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(4, 768, 2, 128, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    used = torch.tensor([300, 700, 768, 500], device="cuda", dtype=torch.int32)
+    cu = torch.tensor([0, 1, 2, 3, 3], device="cuda", dtype=torch.int32)
+    out = torch.full((4, 6, 128), float("nan"), device="cuda", dtype=q.dtype)
+    lse = torch.full((6, 4), float("nan"), device="cuda", dtype=torch.float32)
+    _flash_attn_fwd(
+        q[:, 0],
+        k,
+        v,
+        cu_seqlens_q=cu,
+        max_seqlen_q=1,
+        seqused_k=used,
+        num_splits=ns,
+        return_lse=True,
+        out=out,
+        lse=lse,
+    )
+    ro, rl = reference(q[:3], k[:3], v[:3], used[:3])
+    torch.testing.assert_close(out[:3].float(), ro[:, 0], atol=0.004, rtol=0.025)
+    torch.testing.assert_close(lse[:, :3], rl[:, :, 0].t(), atol=0.004, rtol=0.003)
+    assert out[3].isnan().all() and lse[:, 3].isnan().all()
+
+
+@pytest.mark.parametrize("ns", [1, 3])
+def test_varlen_single_query_large_batch(ns):
+    """Above 256 sequences the general varlen scheduler builds tile metadata; SwapAB needs none."""
+    torch.manual_seed(6)
+    q = torch.randn(300, 1, 6, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(300, 300, 2, 64, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    used = torch.randint(1, 301, (300,), device="cuda", dtype=torch.int32)
+    cu = torch.arange(301, device="cuda", dtype=torch.int32)
+    o, lse, *_ = _flash_attn_fwd(
+        q[:, 0],
+        k,
+        v,
+        cu_seqlens_q=cu,
+        max_seqlen_q=1,
+        seqused_k=used,
+        num_splits=ns,
+        return_lse=True,
+    )
+    ro, rl = reference(q, k, v, used)
+    torch.testing.assert_close(o.float(), ro[:, 0], atol=0.004, rtol=0.025)
+    torch.testing.assert_close(lse, rl[:, :, 0].t(), atol=0.004, rtol=0.003)
 
 
 @pytest.mark.parametrize("blocks", [3, 8])

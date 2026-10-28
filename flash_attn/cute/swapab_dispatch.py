@@ -13,7 +13,7 @@ FORWARD_OPTION_POLICY = MappingProxyType(
         "k": "canonical tensor",
         "v": "canonical tensor",
         "qv": "unsupported",
-        "cu_seqlens_q": "unsupported",
+        "cu_seqlens_q": "one query per sequence",
         "cu_seqlens_k": "unsupported",
         "seqused_q": "unsupported",
         "seqused_k": "supported",
@@ -113,19 +113,32 @@ def select_swapab_backend(
     # for other values instead of silently changing score/max semantics.
     if scale is not None and (not math.isfinite(scale) or scale <= 0):
         return reject("nonpositive/nonfinite softmax_scale")
-    if arch != 100:
-        return reject("architecture must be SM100")
+    if arch not in (100, 103):
+        return reject("architecture must be SM100 or SM103")
     if requires_grad or any(t.requires_grad for t in request.get("aux_tensors") or ()):
         return reject("training")
-    if any(t is None or len(t.shape) != 4 for t in (q, k, v)):
-        return reject("dense rank-four Q/K/V required")
+    # Varlen Q is (total_q, h, d) with at most one token per sequence (host max_seqlen_q == 1).
+    varlen_q = request.get("cu_seqlens_q") is not None
+    max_seqlen_q = request.get("max_seqlen_q")
+    if varlen_q and not (isinstance(max_seqlen_q, int) and max_seqlen_q == 1):
+        return reject("cu_seqlens_q needs max_seqlen_q == 1")
+    if (
+        q is None
+        or len(q.shape) != (3 if varlen_q else 4)
+        or any(t is None or len(t.shape) != 4 for t in (k, v))
+    ):
+        return reject("rank-four K/V and Q ((total_q, h, d) with cu_seqlens_q) required")
     if str(q.dtype) not in ("torch.float16", "torch.bfloat16") or not q.dtype == k.dtype == v.dtype:
         return reject("dtype")
-    if q.shape[1] != 1 or q.shape[3] not in (64, 96, 128) or v.shape[3] not in (64, 96, 128):
+    if (
+        (not varlen_q and q.shape[1] != 1)
+        or q.shape[-1] not in (64, 96, 128)
+        or v.shape[3] not in (64, 96, 128)
+    ):
         return reject("single query / head dimensions")
-    if k.shape[3] != q.shape[3] or k.shape[:3] != v.shape[:3]:
+    if k.shape[3] != q.shape[-1] or k.shape[:3] != v.shape[:3]:
         return reject("K/V shapes")
-    if k.shape[2] <= 0 or q.shape[2] % k.shape[2] or not 1 <= q.shape[2] // k.shape[2] <= 32:
+    if k.shape[2] <= 0 or q.shape[-2] % k.shape[2] or not 1 <= q.shape[-2] // k.shape[2] <= 32:
         return reject("GQA ratio")
     if any(t.stride(-1) != 1 for t in (q, k, v)):
         return reject("contiguous head dimension")
@@ -134,7 +147,8 @@ def select_swapab_backend(
             return reject("page size must be divisible by 256")
         capacity = page_table.shape[1] * k.shape[1]
     else:
-        if q.shape[0] != k.shape[0]:
+        batch_size = request["cu_seqlens_q"].shape[0] - 1 if varlen_q else q.shape[0]
+        if batch_size != k.shape[0]:
             return reject("batch size")
         capacity = k.shape[1]
-    return SwapABDecision(True, "eligible SM100 single-query inference", capacity)
+    return SwapABDecision(True, "eligible SM100/SM103 single-query inference", capacity)

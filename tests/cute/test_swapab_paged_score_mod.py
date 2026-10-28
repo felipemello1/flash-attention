@@ -15,8 +15,8 @@ from flash_attn.cute.interface import _flash_attn_fwd
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
-    reason="requires SM100 for paged SwapAB score modifiers",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="requires SM100 / SM103 for paged SwapAB score modifiers",
 )
 
 

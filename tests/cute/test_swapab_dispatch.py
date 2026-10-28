@@ -140,11 +140,27 @@ class DispatchTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, name):
                     decide(dispatch, request, mode="swapab")
 
+    def test_varlen_single_query(self):
+        dispatch = load_dispatch()
+        varlen = dict(q=TensorMetadata((2, 6, 96)), cu_seqlens_q=TensorMetadata((3,)))
+        self.assertTrue(decide(dispatch, request_defaults(**varlen, max_seqlen_q=1)).use_swapab)
+        for max_seqlen_q in (None, 2):
+            with self.subTest(max_seqlen_q=max_seqlen_q):
+                decision = decide(dispatch, request_defaults(**varlen, max_seqlen_q=max_seqlen_q))
+                self.assertFalse(decision.use_swapab)
+                self.assertIn("max_seqlen_q", decision.reason)
+        # Dense K needs one cache row per sequence.
+        request = request_defaults(
+            q=TensorMetadata((3, 6, 96)), cu_seqlens_q=TensorMetadata((4,)), max_seqlen_q=1
+        )
+        self.assertFalse(decide(dispatch, request).use_swapab)
+
     def test_architecture_training_dtype_and_shape_guards(self):
         dispatch = load_dispatch()
         for arch in (80, 90, 101, 110, 120):
             with self.subTest(arch=arch):
                 self.assertFalse(decide(dispatch, arch=arch).use_swapab)
+        self.assertTrue(decide(dispatch, arch=103).use_swapab)
         self.assertFalse(decide(dispatch, requires_grad=True).use_swapab)
         for name, shape in (
             ("q", (2, 2, 6, 96)),

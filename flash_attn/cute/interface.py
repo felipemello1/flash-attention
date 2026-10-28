@@ -1287,6 +1287,7 @@ def _flash_attn_fwd(
         and scheduler_metadata is None
         and not disable_scheduler_metadata
         and qv is None
+        and not swapab.use_swapab
     ):
         scheduler_metadata = _get_scheduler_metadata(
             num_batch=batch_size,
@@ -1352,6 +1353,7 @@ def _flash_attn_fwd(
         and use_single_tile_varlen_scheduler
         and batch_size > BIN_BATCH_SEARCH_THRESH
         and qv is None
+        and not swapab.use_swapab
     )
     if (
         use_cu_hint
